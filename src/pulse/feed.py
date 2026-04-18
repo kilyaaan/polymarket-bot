@@ -284,28 +284,21 @@ def spike_monitor_loop(scan_state):
                     last_logged["ts"] = now
                     last_logged["dir"] = direction_sp
 
-                    from pulse.strategy import compute_score
-                    sc_sp, _, _ = compute_score(
-                        None, direction_sp, m15, m30, m60,
-                        remaining_min=3.0, window_delta=0.0,
-                    )
-                    min_s = scan_state["settings"].min_score
                     if abs_m15 >= SPIKE_THRESHOLD:
-                        action = "INTERRUPT" if sc_sp >= min_s else "watch"
+                        action = "INTERRUPT"
+                        SPIKE_INTERRUPT.set()
+                        log.info("SPIKE %s m15=%.4f%%", direction_sp, m15)
                     else:
-                        action = "signal" if sc_sp >= min_s else "noise"
+                        action = "signal"
 
                     scan_state["spikes"].appendleft({
                         "dir": direction_sp,
                         "mom15": round(m15, 4),
                         "mom60": round(m60, 4),
-                        "score": sc_sp,
+                        "score": round(abs_m15, 4),
                         "action": action,
                         "strong": abs_m15 >= SPIKE_THRESHOLD,
                     })
-                    if abs_m15 >= SPIKE_THRESHOLD:
-                        SPIKE_INTERRUPT.set()
-                        log.info("SPIKE %s m15=%.4f%% score=%.3f", direction_sp, m15, sc_sp)
         except Exception as e:
             log.warning("Spike monitor error: %s", e)
         time.sleep(0.5)
