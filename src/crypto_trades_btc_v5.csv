@@ -1,0 +1,1 @@
+timestamp,direction,entry,exit,shares_held,size_usdc,kelly_used,pnl_gross,pnl_net,pnl_pct,fees,duration_min,btc_entry,btc_exit,score,mom15_entry,rsi_entry,min_score,reason,held_expiry,order_id,close_order_id,close_fill

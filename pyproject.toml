@@ -1,0 +1,28 @@
+[project]
+name = "crypto-pulse"
+version = "5.0.0"
+description = "Polymarket BTC 5-min binary options sniper"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31",
+    "websocket-client>=1.7",
+    "numpy>=1.26",
+    "rich>=13.7",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+live = [
+    "py-clob-client>=0.15",
+    "eth-account>=0.11",
+]
+
+[project.scripts]
+pulse = "pulse.main:cli"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[tool.setuptools.packages.find]
+where = ["src"]
