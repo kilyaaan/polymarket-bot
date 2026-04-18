@@ -63,7 +63,7 @@ def make_dashboard(
     # Header
     layout["header"].update(Panel(
         Text.assemble(
-            (" CRYPTO PULSE v5.0-BTC ", "bold #f7931a"),
+            (" CRYPTO PULSE v6.0-BTC ", "bold #f7931a"),
             (" | scan #", "dim"), (str(stats.scans), "white"),
             (" | ", "dim"), (stats.elapsed, "yellow"),
             (" | next: ", "dim"), (f"{int(countdown)}s", "bold cyan"),
@@ -270,7 +270,7 @@ def make_dashboard(
             f" | Entry:{MIN_ENTRY_PRICE:.2f}-{MAX_ENTRY_PRICE:.2f}"
             f" | Spike:>{SPIKE_THRESHOLD:.2%}"
             f" | Window:{ENTRY_WINDOW_MIN}-{ENTRY_WINDOW_MAX}min"
-            f" | Scan:{si}s CB:-{max_dl:.0f}$ | v5.0-BTC",
+            f" | Scan:{si}s CB:-{max_dl:.0f}$ | v6.0-BTC",
         ),
         style="on #080a0c", border_style="#1a2030",
     ))

@@ -1,3 +1,3 @@
-"""Crypto Pulse Sniper v5.0 — Polymarket BTC binary options."""
+"""Crypto Pulse Sniper v6.0 — Polymarket BTC binary options."""
 
-__version__ = "5.0.0"
+__version__ = "6.0.0"
