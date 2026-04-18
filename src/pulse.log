@@ -1,0 +1,9 @@
+2026-04-18 15:48:13,725 INFO  [websocket] Websocket connected
+2026-04-18 15:48:13,727 INFO  [pulse.feed] Binance WS connected
+2026-04-18 15:48:14,975 ERROR [pulse.orders] PRIVATE_KEY missing in .env
+2026-04-18 15:48:15,651 WARNING [__main__] Wallet not found — fallback 200$
+2026-04-18 15:49:12,781 INFO  [pulse.orders] CLOB creds loaded from env
+2026-04-18 15:49:12,804 INFO  [websocket] Websocket connected
+2026-04-18 15:49:12,806 INFO  [pulse.feed] Binance WS connected
+2026-04-18 15:49:15,029 INFO  [__main__] USDC.e on-chain: 11.13$
+2026-04-18 15:50:45,116 INFO  [pulse.feed] SPIKE UP m15=0.0672% score=0.674

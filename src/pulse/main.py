@@ -52,26 +52,38 @@ def _make_scan_state() -> dict:
 
 
 # ── Keyboard handler ────────────────────────────────────────────────────────
+def _handle_key(ch: str) -> None:
+    if ch in ("+", "="):
+        SETTINGS.increase()
+    elif ch == "-":
+        SETTINGS.decrease()
+    elif ch == "r":
+        SETTINGS.reset()
+    elif ch == "a":
+        SETTINGS.toggle_auto()
+    elif ch == "q":
+        SHUTDOWN_EVENT.set()
+
+
 def _keyboard_thread():
     try:
-        import tty, termios
+        import select
+        import tty
+        import termios
         fd = sys.stdin.fileno()
         old = termios.tcgetattr(fd)
         try:
-            tty.setraw(fd)
+            # setcbreak instead of setraw:
+            #   - single-key reads without Enter (same as raw)
+            #   - Ctrl+C still generates SIGINT (unlike raw)
+            #   - output processing (ONLCR \n→\r\n) stays ON
+            #     → prevents the cursor drift that corrupts Rich on SSH/MobaXterm
+            tty.setcbreak(fd)
             while not SHUTDOWN_EVENT.is_set():
-                ch = sys.stdin.read(1).lower()
-                if ch in ("+", "="):
-                    SETTINGS.increase()
-                elif ch == "-":
-                    SETTINGS.decrease()
-                elif ch == "r":
-                    SETTINGS.reset()
-                elif ch == "a":
-                    SETTINGS.toggle_auto()
-                elif ch == "q":
-                    SHUTDOWN_EVENT.set()
-                    break
+                ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if ready:
+                    ch = sys.stdin.read(1).lower()
+                    _handle_key(ch)
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
     except Exception:
@@ -80,26 +92,18 @@ def _keyboard_thread():
             while not SHUTDOWN_EVENT.is_set():
                 if msvcrt.kbhit():
                     ch = msvcrt.getch().decode("utf-8", "ignore").lower()
-                    if ch in ("+", "="):
-                        SETTINGS.increase()
-                    elif ch == "-":
-                        SETTINGS.decrease()
-                    elif ch == "r":
-                        SETTINGS.reset()
-                    elif ch == "a":
-                        SETTINGS.toggle_auto()
-                    elif ch == "q":
-                        SHUTDOWN_EVENT.set()
-                        break
+                    _handle_key(ch)
                 time.sleep(0.05)
         except Exception:
             pass
 
 
 # ── Main loop ────────────────────────────────────────────────────────────────
-def run(dry: bool = True, hold_enabled: bool = True):
-    console = Console()
-    setup_logging()
+def run(dry: bool = True, hold_enabled: bool = True, log_level: str = "INFO"):
+    # force_terminal=True ensures Rich works correctly over SSH / MobaXterm
+    # where terminal capability detection can fail
+    console = Console(force_terminal=True)
+    setup_logging(log_level)
     init_csv()
 
     # Private key warning
@@ -577,7 +581,7 @@ def cli():
         print("\nLIVE MODE in 5s — Ctrl+C to cancel...")
         time.sleep(5)
 
-    run(dry=not args.live, hold_enabled=hold_enabled)
+    run(dry=not args.live, hold_enabled=hold_enabled, log_level=args.log_level)
 
 
 if __name__ == "__main__":

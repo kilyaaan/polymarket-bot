@@ -20,12 +20,22 @@ log = logging.getLogger("pulse")
 
 
 def setup_logging(level: str = "INFO"):
-    """Configure root logger with console + rotating file output."""
+    """Configure root logger — file only, no StreamHandler.
+
+    Logging to stdout/stderr is intentionally disabled: the Rich Live TUI
+    owns the terminal and any direct writes corrupt the display.
+    All output goes to pulse.log instead.
+    """
     fmt = "%(asctime)s %(levelname)-5s [%(name)s] %(message)s"
-    logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO), format=fmt)
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, level.upper(), logging.INFO))
+
+    # Remove ALL existing handlers (basicConfig / any prior call)
+    root.handlers.clear()
+
     fh = RotatingFileHandler("pulse.log", maxBytes=5_000_000, backupCount=3)
     fh.setFormatter(logging.Formatter(fmt))
-    logging.getLogger().addHandler(fh)
+    root.addHandler(fh)
 
 
 # ── Telegram ─────────────────────────────────────────────────────────────────
