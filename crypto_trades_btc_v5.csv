@@ -1,2 +1,0 @@
-timestamp,direction,entry,exit,shares_held,size_usdc,kelly_used,pnl_gross,pnl_net,pnl_pct,fees,duration_min,btc_entry,btc_exit,score,mom15_entry,rsi_entry,min_score,reason,held_expiry,order_id,close_order_id,close_fill
-2026-04-18T03:16:23.972635,UP,0.52,0.46,6.7308,3.5,3.5,-0.4038,-0.5357,-15.31,0.1319,0.0,77318.8,77318.8,0.494,0.0399,83.4,0.45,SL 0.465(<0.470),False,dry_1776474981837,dry_close_1776474983972,filled
