@@ -1,196 +1,130 @@
-"""Strategy — scoring, Kelly sizing, direction voting, coherence."""
+"""Strategy v6 — Late Trend heuristics, calibrated on 10h of real Polymarket data.
+
+7 heuristics, zero composite score, ~40 lines of decision logic.
+
+Data basis (observed 2026-04-18, 129 markets, 32K snapshots):
+  - Mid-price at T<=60s predicts resolution with 86.3% accuracy
+  - At |window_delta| > 0.05%: 97.3% accuracy (37 markets)
+  - At |window_delta| > 0.10%: 100% accuracy (10 markets)
+  - Spread median: 0.01, amplification: 18x median
+"""
 
 from __future__ import annotations
 
-import csv
 import logging
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
-from pulse.config import (
-    MIN_POS, MAX_POS, SPIKE_THRESHOLD,
-    MOM_15S_REF, MOM_30S_REF, MOM_60S_REF,
-    RSI_OVERBOUGHT, RSI_OVERSOLD, TRADES_CSV,
-)
-from pulse.feed import FEED
+from dataclasses import dataclass
+from typing import List, Optional
 
 log = logging.getLogger(__name__)
 
+# ── Thresholds (calibrated from collected data) ──────────────────────────────
+DELTA_THRESHOLD = 0.05    # minimum |window_delta| % to trade
+LATE_ENTRY_SEC = 60       # only enter in last 60s of market
+MAX_ENTRY_PRICE = 0.70    # skip if option already too expensive
+COOLDOWN_LOSSES = 3       # pause after N consecutive losses
+COOLDOWN_MARKETS = 3      # skip N markets during cooldown
 
-# ── Direction voting ─────────────────────────────────────────────────────────
-def vote_direction(m15: float, m30: float, m60: float) -> str:
-    """Simple majority across 3 timeframes. No single timeframe dominates."""
-    votes_up = sum(1 for m in [m15, m30, m60] if m > 0)
-    return "UP" if votes_up >= 2 else "DOWN"
+# Sizing tiers (CYNIC verdict mapping)
+SIZE_HOWL = 15.0           # |delta| > 0.15%
+SIZE_WAG = 10.0            # |delta| > 0.10%
+SIZE_GROWL = 5.0           # |delta| > 0.05%
+
+DELTA_HOWL = 0.15
+DELTA_WAG = 0.10
 
 
-# ── Coherence — magnitude-weighted ──────────────────────────────────────────
-def coherence_bonus(m15: float, m30: float, m60: float, direction: str) -> float:
-    """Proportional bonus when all timeframes agree in magnitude, not just sign."""
-    moms = [m15, m30, m60] if direction == "UP" else [-m15, -m30, -m60]
-    if not all(m > 0 for m in moms):
-        return 0.0
-    strength = min(
-        abs(m15) / MOM_15S_REF,
-        abs(m30) / MOM_30S_REF,
-        abs(m60) / MOM_60S_REF,
+@dataclass
+class TradeSignal:
+    """Output of the gate logic. Either trade or skip."""
+    trade: bool
+    direction: str = ""
+    size_usdc: float = 0.0
+    verdict: str = ""       # HOWL/WAG/GROWL/BARK
+    window_delta: float = 0.0
+    reason: str = ""
+
+
+def evaluate_gates(
+    btc_now: float,
+    btc_market_open: float,
+    remaining_sec: float,
+    entry_price: float,
+    consecutive_losses: int,
+    cooldown_remaining: int,
+) -> TradeSignal:
+    """
+    3 binary gates + direction + sizing. No composite score.
+
+    H1: Regime gate     — |window_delta| > 0.05%
+    H2: Late entry      — remaining_sec <= 60
+    H3: Direction = fact — btc_now vs btc_market_open
+    H4: Max entry price  — entry_price <= 0.70
+    H5: Sizing by tier   — HOWL/WAG/GROWL based on |delta|
+    H6: Hold-to-expiry   — (enforced in main loop, not here)
+    H7: Cooldown         — 3 consecutive losses → pause
+    """
+    skip = lambda reason: TradeSignal(trade=False, reason=reason)
+
+    # H7: Cooldown
+    if cooldown_remaining > 0:
+        return skip(f"COOLDOWN ({cooldown_remaining} left)")
+
+    if consecutive_losses >= COOLDOWN_LOSSES:
+        return skip(f"COOLDOWN triggered ({consecutive_losses} losses)")
+
+    # H2: Late entry
+    if remaining_sec > LATE_ENTRY_SEC:
+        return skip(f"too early ({remaining_sec:.0f}s > {LATE_ENTRY_SEC}s)")
+
+    if remaining_sec <= 5:
+        return skip("too late (<5s)")
+
+    # H1: Regime gate
+    if btc_market_open <= 0:
+        return skip("no market open price")
+
+    window_delta = (btc_now - btc_market_open) / btc_market_open * 100
+    abs_delta = abs(window_delta)
+
+    if abs_delta < DELTA_THRESHOLD:
+        return skip(f"delta {abs_delta:.4f}% < {DELTA_THRESHOLD}%")
+
+    # H3: Direction = observed fact
+    direction = "UP" if btc_now > btc_market_open else "DOWN"
+
+    # H4: Max entry price
+    if entry_price > MAX_ENTRY_PRICE:
+        return skip(f"price {entry_price:.3f} > {MAX_ENTRY_PRICE}")
+
+    if entry_price <= 0.01:
+        return skip(f"price {entry_price:.3f} too low")
+
+    # H5: Sizing by tier
+    if abs_delta >= DELTA_HOWL:
+        size = SIZE_HOWL
+        verdict = "HOWL"
+    elif abs_delta >= DELTA_WAG:
+        size = SIZE_WAG
+        verdict = "WAG"
+    else:
+        size = SIZE_GROWL
+        verdict = "GROWL"
+
+    log.info(
+        "GATE PASS: %s delta=%.4f%% entry=%.3f size=$%.0f verdict=%s rem=%0.fs",
+        direction, window_delta, entry_price, size, verdict, remaining_sec,
     )
-    return min(0.12, 0.08 * strength)
 
-
-# ── Score v5.0 ───────────────────────────────────────────────────────────────
-def compute_score(
-    ob: Optional[dict],
-    direction: str,
-    m15: float, m30: float, m60: float,
-    remaining_min: float = 3.0,
-    window_delta: float = 0.0,
-) -> Tuple[float, float, float]:
-    """
-    Entry score v5.0.
-
-    raw = (0.45*mom + 0.20*imb + 0.10*rsi + 0.15*wd + 0.05*vol
-           + spike_bonus + coherence) * time_factor
-    """
-    def ds(mom: float, ref: float) -> float:
-        if direction == "UP":
-            return min(abs(mom) / ref, 1.0) if mom > 0 else 0.0
-        return min(abs(mom) / ref, 1.0) if mom < 0 else 0.0
-
-    mom_score = (
-        ds(m15, MOM_15S_REF) * 0.50
-        + ds(m30, MOM_30S_REF) * 0.30
-        + ds(m60, MOM_60S_REF) * 0.20
+    return TradeSignal(
+        trade=True,
+        direction=direction,
+        size_usdc=size,
+        verdict=verdict,
+        window_delta=window_delta,
+        reason=f"{verdict} delta={window_delta:+.4f}%",
     )
 
-    spike_bonus = 0.15 if abs(m15) >= SPIKE_THRESHOLD else 0.0
 
-    # OB imbalance — both UP and DOWN computed correctly
-    imb_score = 0.0
-    if ob and ob["total_d"] > 0:
-        imb = ob["bid_d"] / ob["total_d"]
-        if direction == "UP":
-            imb_score = min((imb - 0.5) * 4, 1.0) if imb > 0.5 else 0.0
-        else:
-            imb_score = min((0.5 - imb) * 4, 1.0) if imb < 0.5 else 0.0
-
-    # RSI on candle closes
-    rsi = FEED.rsi()
-    if direction == "UP":
-        rsi_score = min((rsi - RSI_OVERBOUGHT) / (100.0 - RSI_OVERBOUGHT), 1.0) if rsi > RSI_OVERBOUGHT else 0.0
-    else:
-        rsi_score = min((RSI_OVERSOLD - rsi) / RSI_OVERSOLD, 1.0) if rsi < RSI_OVERSOLD else 0.0
-
-    # Volatility
-    vol_score = min(FEED.volatility() / 150.0, 1.0)
-
-    # Window delta
-    wd_aligned = window_delta if direction == "UP" else -window_delta
-    wd_score = max(min(wd_aligned / 0.10, 1.0), 0.0)
-
-    # Coherence — magnitude-weighted
-    coh = coherence_bonus(m15, m30, m60, direction)
-
-    # Time penalty
-    if remaining_min < 1.0:
-        time_factor = 0.5
-    elif remaining_min < 1.5:
-        time_factor = 0.75
-    else:
-        time_factor = 1.0
-
-    raw = (
-        0.45 * mom_score + 0.20 * imb_score + 0.10 * rsi_score
-        + 0.15 * wd_score + 0.05 * vol_score
-        + spike_bonus + coh
-    ) * time_factor
-    return round(min(raw, 1.0), 3), mom_score, imb_score
-
-
-# ── Kelly fractional sizing — calibrated ─────────────────────────────────────
-_win_prob_cache: Dict[str, float] = {}
-_win_prob_cache_age: float = 0.0
-_CACHE_TTL = 300.0  # recalculate every 5 minutes
-
-
-def _load_win_rates(csv_path: Path) -> Dict[str, float]:
-    """Compute win rate per score bucket from trade history CSV."""
-    buckets: Dict[str, list] = {
-        "0.50-0.60": [], "0.60-0.70": [], "0.70-0.80": [], "0.80+": [],
-    }
-    try:
-        with open(csv_path, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                try:
-                    score = float(row.get("score", 0))
-                    pnl = float(row.get("pnl_net", 0))
-                except (ValueError, TypeError):
-                    continue
-                if score < 0.50:
-                    continue
-                if score < 0.60:
-                    buckets["0.50-0.60"].append(pnl >= 0)
-                elif score < 0.70:
-                    buckets["0.60-0.70"].append(pnl >= 0)
-                elif score < 0.80:
-                    buckets["0.70-0.80"].append(pnl >= 0)
-                else:
-                    buckets["0.80+"].append(pnl >= 0)
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        log.warning("Error reading trade CSV for calibration: %s", e)
-
-    result = {}
-    for bucket_name, outcomes in buckets.items():
-        if len(outcomes) >= 30:
-            result[bucket_name] = sum(outcomes) / len(outcomes)
-            log.info("kelly: bucket=%s source=calibrated p=%.3f n=%d",
-                     bucket_name, result[bucket_name], len(outcomes))
-        else:
-            result[bucket_name] = 0.50
-            log.info("kelly: bucket=%s source=fallback p=0.50 n=%d",
-                     bucket_name, len(outcomes))
-    return result
-
-
-def _get_win_prob(score: float) -> float:
-    """Get calibrated win probability for a score, with caching."""
-    global _win_prob_cache, _win_prob_cache_age
-    import time
-    now = time.time()
-    if now - _win_prob_cache_age > _CACHE_TTL:
-        _win_prob_cache = _load_win_rates(TRADES_CSV)
-        _win_prob_cache_age = now
-
-    if score < 0.60:
-        return _win_prob_cache.get("0.50-0.60", 0.50)
-    elif score < 0.70:
-        return _win_prob_cache.get("0.60-0.70", 0.50)
-    elif score < 0.80:
-        return _win_prob_cache.get("0.70-0.80", 0.50)
-    else:
-        return _win_prob_cache.get("0.80+", 0.50)
-
-
-def kelly_size(score: float, entry_price: float, bankroll: float) -> float:
-    """
-    1/4 Kelly sizing with calibrated win probability.
-
-    Uses historical win rate per score bucket when >= 30 samples available.
-    Falls back to conservative 0.50 during cold start.
-    """
-    win_prob = max(0.45, min(0.75, _get_win_prob(score)))
-    b = (1.0 - entry_price) / max(entry_price, 0.01)
-    q = 1.0 - win_prob
-    kelly_f = (b * win_prob - q) / b
-    if kelly_f <= 0:
-        return MIN_POS
-    return max(MIN_POS, min(MAX_POS, round(bankroll * kelly_f * 0.25, 2)))
-
-
-# ── Position correlation ─────────────────────────────────────────────────────
 def has_overlapping_position(
     positions: List, new_market, direction: str,
 ) -> bool:
