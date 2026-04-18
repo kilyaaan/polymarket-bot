@@ -1,6 +1,6 @@
 [project]
 name = "crypto-pulse"
-version = "5.0.0"
+version = "6.0.0"
 description = "Polymarket BTC 5-min binary options sniper"
 requires-python = ">=3.10"
 dependencies = [
@@ -9,6 +9,7 @@ dependencies = [
     "numpy>=1.26",
     "rich>=13.7",
     "python-dotenv>=1.0",
+    "pyfiglet>=1.0",
 ]
 
 [project.optional-dependencies]

@@ -106,8 +106,15 @@ def run(dry: bool = True, log_level: str = "INFO"):
         ))
         time.sleep(2)
 
+    try:
+        from pyfiglet import Figlet
+        _fig = Figlet(font="doom", width=console.width or 100)
+        ascii_title = _fig.renderText("JOSSELIN III") + _fig.renderText("CRYPTO PULSE v5")
+    except ImportError:
+        ascii_title = "JOSSELIN III\nCRYPTO PULSE v5\n"
+
     console.print(Panel(
-        f"[bold #f7931a]CRYPTO PULSE v6.0 — Late Trend[/]\n"
+        f"[bold #f7931a]{ascii_title}[/]"
         f"Mode     : {'[bold red]LIVE[/]' if not dry else '[bold cyan]SIMULATION[/]'}\n"
         f"Strategy : [bold green]3 gates + hold-to-expiry[/]\n"
         f"  Gate 1 : |window_delta| > 0.05%\n"
