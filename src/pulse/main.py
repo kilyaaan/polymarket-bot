@@ -48,24 +48,34 @@ def _make_scan_state() -> dict:
     }
 
 
+def _handle_key(ch: str) -> None:
+    if ch in ("+", "="):
+        SETTINGS.increase()
+    elif ch == "-":
+        SETTINGS.decrease()
+    elif ch == "r":
+        SETTINGS.reset()
+    elif ch == "q":
+        SHUTDOWN_EVENT.set()
+
+
 def _keyboard_thread():
     try:
-        import tty, termios
+        import select
+        import tty
+        import termios
         fd = sys.stdin.fileno()
         old = termios.tcgetattr(fd)
         try:
-            tty.setraw(fd)
+            # setcbreak (not setraw): single-key reads without Enter,
+            # but preserves output processing (ONLCR \n→\r\n).
+            # setraw disables ONLCR which causes cursor drift in Rich on SSH.
+            tty.setcbreak(fd)
             while not SHUTDOWN_EVENT.is_set():
-                ch = sys.stdin.read(1).lower()
-                if ch in ("+", "="):
-                    SETTINGS.increase()
-                elif ch == "-":
-                    SETTINGS.decrease()
-                elif ch == "r":
-                    SETTINGS.reset()
-                elif ch == "q":
-                    SHUTDOWN_EVENT.set()
-                    break
+                ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if ready:
+                    ch = sys.stdin.read(1).lower()
+                    _handle_key(ch)
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
     except Exception:
@@ -74,23 +84,15 @@ def _keyboard_thread():
             while not SHUTDOWN_EVENT.is_set():
                 if msvcrt.kbhit():
                     ch = msvcrt.getch().decode("utf-8", "ignore").lower()
-                    if ch in ("+", "="):
-                        SETTINGS.increase()
-                    elif ch == "-":
-                        SETTINGS.decrease()
-                    elif ch == "r":
-                        SETTINGS.reset()
-                    elif ch == "q":
-                        SHUTDOWN_EVENT.set()
-                        break
+                    _handle_key(ch)
                 time.sleep(0.05)
         except Exception:
             pass
 
 
-def run(dry: bool = True):
-    console = Console()
-    setup_logging()
+def run(dry: bool = True, log_level: str = "INFO"):
+    console = Console(force_terminal=True)
+    setup_logging(log_level)
     init_csv()
 
     import os
@@ -231,8 +233,8 @@ def run(dry: bool = True):
                     all_markets = get_cached_markets()
                     scan_state["active_markets"] = all_markets
 
-                    # Decrement cooldown
-                    if cooldown_remaining > 0 and closed:
+                    # Decrement cooldown every scan (not gated on closed positions)
+                    if cooldown_remaining > 0:
                         cooldown_remaining -= 1
 
                     # Sort by |window_delta| descending — best signal first
@@ -252,19 +254,31 @@ def run(dry: bool = True):
                         if len(positions) >= MAX_OPEN_POS:
                             break
 
-                        # Fetch OB for the direction we'd trade
                         btc_now = FEED.current
+                        rem_sec = mkt.remaining_sec
+
+                        # Skip timing check early — avoids a wasted OB fetch
+                        # for every market that isn't in the late-entry window
+                        if rem_sec > 60 or rem_sec <= 5:
+                            scan_state["log"].appendleft({
+                                "type": "skip", "dir": "-",
+                                "reason": f"timing {rem_sec:.0f}s",
+                                "mom15": m15, "mom60": m60,
+                            })
+                            continue
+
+                        # Fetch OB only for markets in the late window
                         direction_guess = "UP" if btc_now > mkt.start_price else "DOWN"
                         tok = mkt.yes_token if direction_guess == "UP" else mkt.no_token
                         ob = get_ob(tok)
 
                         entry_price = ob["ba"] if ob else 0.0
 
-                        # Run gates
+                        # Run full gates
                         signal = evaluate_gates(
                             btc_now=btc_now,
                             btc_market_open=mkt.start_price,
-                            remaining_sec=mkt.remaining_sec,
+                            remaining_sec=rem_sec,
                             entry_price=entry_price,
                             consecutive_losses=consecutive_losses,
                             cooldown_remaining=cooldown_remaining,
@@ -424,7 +438,7 @@ def cli():
         print("\nLIVE MODE in 5s — Ctrl+C to cancel...")
         time.sleep(5)
 
-    run(dry=not args.live)
+    run(dry=not args.live, log_level=args.log_level)
 
 
 if __name__ == "__main__":

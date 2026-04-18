@@ -65,12 +65,9 @@ def evaluate_gates(
     """
     skip = lambda reason: TradeSignal(trade=False, reason=reason)
 
-    # H7: Cooldown
+    # H7: Cooldown — single check, consecutive_losses resets on any win
     if cooldown_remaining > 0:
         return skip(f"COOLDOWN ({cooldown_remaining} left)")
-
-    if consecutive_losses >= COOLDOWN_LOSSES:
-        return skip(f"COOLDOWN triggered ({consecutive_losses} losses)")
 
     # H2: Late entry
     if remaining_sec > LATE_ENTRY_SEC:
