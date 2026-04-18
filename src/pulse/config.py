@@ -10,10 +10,6 @@ from typing import Tuple
 
 from dotenv import load_dotenv
 
-# SoC: operator env (~/.pulse-env) takes precedence over project .env
-_operator_env = Path.home() / ".pulse-env"
-if _operator_env.exists():
-    load_dotenv(_operator_env)
 load_dotenv()
 
 # ── Wallet / API ─────────────────────────────────────────────────────────────
