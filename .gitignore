@@ -1,0 +1,17 @@
+.env
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/
+
+# Runtime data
+positions.json
+.positions.json.tmp
+pulse.log*
+*.out
+
+# Trade data (generated, not source)
+crypto_trades_*.csv
+polymarket_data.csv
