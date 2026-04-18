@@ -255,7 +255,7 @@ def run(dry: bool = True, log_level: str = "INFO"):
                             continue
                         delta = abs((FEED.current - mkt.start_price) / mkt.start_price * 100)
                         scored_markets.append((delta, mkt))
-                    scored_markets.sort(reverse=True)
+                    scored_markets.sort(key=lambda x: x[0], reverse=True)
 
                     for _, mkt in scored_markets:
                         if len(positions) >= MAX_OPEN_POS:
