@@ -76,14 +76,15 @@ def get_fee_rate(token_id: str) -> float:
         )
         if r.status_code == 200:
             d = r.json()
-            rate = d.get("fee_rate") or d.get("feeRate")
-            if rate is None:
-                bps = d.get("fee_rate_bps")
-                if bps is not None:
-                    rate = float(bps) / 10000.0
+            # API returns {"base_fee": 1000} where 1000 bps / 50000 = 0.02 (2%)
+            raw = (d.get("base_fee") or d.get("fee_rate_bps")
+                   or d.get("fee_rate") or d.get("feeRate"))
+            rate = None
+            if raw is not None:
+                rate = float(raw) / 50000.0
             if rate is not None:
-                FEE_RATE_CACHE[token_id] = float(rate)
-                return float(rate)
+                FEE_RATE_CACHE[token_id] = rate
+                return rate
     except ValueError:
         log.error("Invalid token_id for fee rate: %s", token_id[:20])
     except Exception as e:
@@ -141,13 +142,20 @@ _OB_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ob_fetch")
 def get_ob_multi(token_ids: List[str]) -> Dict[str, Optional[dict]]:
     futures = {_OB_POOL.submit(get_ob, tid): tid for tid in token_ids}
     results: Dict[str, Optional[dict]] = {}
-    for fut in as_completed(futures, timeout=2.5):
-        tid = futures[fut]
-        try:
-            results[tid] = fut.result()
-        except Exception as e:
-            log.debug("OB multi error for %s: %s", tid[:16], e)
-            results[tid] = None
+    try:
+        for fut in as_completed(futures, timeout=2.5):
+            tid = futures[fut]
+            try:
+                results[tid] = fut.result()
+            except Exception as e:
+                log.debug("OB multi error for %s: %s", tid[:16], e)
+                results[tid] = None
+    except TimeoutError:
+        # Fill None for any tokens that didn't complete in time
+        for tid in futures.values():
+            if tid not in results:
+                log.debug("OB multi timeout for %s", tid[:16])
+                results[tid] = None
     return results
 
 
@@ -157,49 +165,53 @@ def shutdown_ob_pool():
 
 # ── CLOB client ──────────────────────────────────────────────────────────────
 _CLOB_CLIENT = None
+_clob_lock = threading.Lock()
 
 
 def get_clob_client():
     global _CLOB_CLIENT
     if _CLOB_CLIENT is not None:
         return _CLOB_CLIENT
-    try:
-        from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import ApiCreds
-        from py_clob_client.constants import POLYGON
+    with _clob_lock:
+        if _CLOB_CLIENT is not None:  # double-checked under lock
+            return _CLOB_CLIENT
+        try:
+            from py_clob_client.client import ClobClient
+            from py_clob_client.clob_types import ApiCreds
+            from py_clob_client.constants import POLYGON
 
-        pk = os.getenv("PRIVATE_KEY", "").strip()
-        if not pk:
-            log.error("PRIVATE_KEY missing in .env")
+            pk = os.getenv("PRIVATE_KEY", "").strip()
+            if not pk:
+                log.error("PRIVATE_KEY missing in .env")
+                return None
+
+            sig_type = int(os.getenv("CLOB_SIGNATURE_TYPE", "1"))
+            funder = (os.getenv("FUNDER", "") or os.getenv("WALLET_ADDRESS", "")).strip()
+
+            if sig_type == 1 and funder:
+                _CLOB_CLIENT = ClobClient(HOST, key=pk, chain_id=POLYGON,
+                                          signature_type=1, funder=funder)
+            else:
+                _CLOB_CLIENT = ClobClient(HOST, key=pk, chain_id=POLYGON,
+                                          signature_type=0)
+
+            api_key = os.getenv("CLOB_API_KEY", "").strip()
+            api_sec = os.getenv("CLOB_SECRET", "").strip()
+            api_pass = os.getenv("CLOB_PASSPHRASE", "").strip()
+
+            if api_key and api_sec and api_pass:
+                _CLOB_CLIENT.set_api_creds(ApiCreds(
+                    api_key=api_key, api_secret=api_sec, api_passphrase=api_pass))
+                log.info("CLOB creds loaded from env")
+            else:
+                log.info("CLOB deriving creds automatically")
+                creds = _CLOB_CLIENT.create_or_derive_api_creds()
+                _CLOB_CLIENT.set_api_creds(creds)
+                log.info("CLOB creds derived")
+            return _CLOB_CLIENT
+        except Exception as e:
+            log.error("CLOB init error: %s", e)
             return None
-
-        sig_type = int(os.getenv("CLOB_SIGNATURE_TYPE", "1"))
-        funder = (os.getenv("FUNDER", "") or os.getenv("WALLET_ADDRESS", "")).strip()
-
-        if sig_type == 1 and funder:
-            _CLOB_CLIENT = ClobClient(HOST, key=pk, chain_id=POLYGON,
-                                      signature_type=1, funder=funder)
-        else:
-            _CLOB_CLIENT = ClobClient(HOST, key=pk, chain_id=POLYGON,
-                                      signature_type=0)
-
-        api_key = os.getenv("CLOB_API_KEY", "").strip()
-        api_sec = os.getenv("CLOB_SECRET", "").strip()
-        api_pass = os.getenv("CLOB_PASSPHRASE", "").strip()
-
-        if api_key and api_sec and api_pass:
-            _CLOB_CLIENT.set_api_creds(ApiCreds(
-                api_key=api_key, api_secret=api_sec, api_passphrase=api_pass))
-            log.info("CLOB creds loaded from env")
-        else:
-            log.info("CLOB deriving creds automatically")
-            creds = _CLOB_CLIENT.create_or_derive_api_creds()
-            _CLOB_CLIENT.set_api_creds(creds)
-            log.info("CLOB creds derived")
-        return _CLOB_CLIENT
-    except Exception as e:
-        log.error("CLOB init error: %s", e)
-        return None
 
 
 # ── Pending order tracking ───────────────────────────────────────────────────
@@ -220,6 +232,23 @@ def _untrack_order(order_id: str):
             pass
 
 
+def cancel_order_safe(order_id: str) -> bool:
+    """Cancel a single order. Returns True if successful."""
+    if not order_id:
+        return False
+    cl = get_clob_client()
+    if cl is None:
+        return False
+    try:
+        cl.cancel(order_id)
+        _untrack_order(order_id)
+        log.info("Cancelled order %s", order_id[:16])
+        return True
+    except Exception as e:
+        log.warning("Cancel order %s failed: %s", order_id[:16], e)
+        return False
+
+
 def cancel_all_pending():
     """Cancel all pending orders (called at shutdown)."""
     cl = get_clob_client()
@@ -229,7 +258,7 @@ def cancel_all_pending():
         orders = list(_pending_orders)
     for oid in orders:
         try:
-            cl.cancel_order(oid)
+            cl.cancel(oid)
             log.info("Cancelled pending order %s", oid[:16])
         except Exception as e:
             log.warning("Cancel order %s failed: %s", oid[:16], e)
@@ -295,16 +324,50 @@ def poll_order_status(order_id: str, timeout: float = 10.0) -> Tuple[str, Option
                 if status in ("cancelled", "canceled"):
                     _untrack_order(order_id)
                     return "cancelled", None
+                # "live" / "delayed" / "unmatched" = resting, keep polling
         except Exception as e:
             log.debug("Poll order %s error: %s", order_id[:16], e)
         time.sleep(0.5)
     return "open", None
 
 
+def place_limit_sell(token_id: str, price: float, shares: float,
+                    dry: bool = True) -> Optional[str]:
+    """Place a resting SELL limit order in the CLOB without waiting for fill.
+    Used to pre-place the stop-loss order immediately after entry."""
+    validate_token_id(token_id)
+    if not (0.01 <= price <= 0.99) or shares <= 0:
+        return None
+    if dry:
+        return f"dry_sl_{int(time.time() * 1000)}"
+    try:
+        from py_clob_client.clob_types import OrderArgs
+        from py_clob_client.order_builder.constants import SELL
+        cl = get_clob_client()
+        if cl is None:
+            return None
+        resp = cl.create_and_post_order(
+            OrderArgs(token_id=token_id, price=price,
+                      size=round(shares, 4), side=SELL))
+        oid = resp.get("orderID") if resp else None
+        if oid:
+            _track_order(oid)
+            log.info("SL order pre-placed: %s price=%.3f shares=%.4f",
+                     oid[:16], price, shares)
+        return oid
+    except Exception as e:
+        log.error("Place SL order error: %s", e)
+        return None
+
+
 def close_position(token_id: str, price: float, shares_held: float,
                    dry: bool = True) -> Tuple[Optional[str], str]:
     """Place a SELL order to close a position."""
     validate_token_id(token_id)
+    if not (0.01 <= price <= 0.99):
+        raise ValueError(f"SELL price out of bounds: {price}")
+    if shares_held <= 0:
+        raise ValueError(f"SELL shares invalid: {shares_held}")
 
     if dry:
         return f"dry_close_{int(time.time() * 1000)}", "filled"
@@ -337,57 +400,15 @@ def close_position(token_id: str, price: float, shares_held: float,
 
 
 # ── Redemption ───────────────────────────────────────────────────────────────
-def redeem_positions() -> float:
-    cl = get_clob_client()
-    if cl is None:
-        return 0.0
-    try:
-        # Use the CLOB client's authenticated method to fetch redeemable positions.
-        # py_clob_client uses L1/L2 HMAC signatures — Bearer token is incorrect here.
-        get_pos = getattr(cl, "get_positions", None)
-        if get_pos is None:
-            log.debug("CLOB client has no get_positions method — skipping redeem")
-            return 0.0
-        positions_data = get_pos() or []
-        if not isinstance(positions_data, list):
-            positions_data = positions_data.get("data") or []
-        total = 0.0
-        for item in positions_data:
-            # Only redeem positions that are resolved/redeemable
-            redeemable = item.get("redeemable") or item.get("can_redeem")
-            if not redeemable:
-                continue
-            cid = item.get("condition_id") or item.get("conditionId")
-            if not cid:
-                continue
-            try:
-                resp = cl.redeem_positions({"conditionId": cid})
-                if resp:
-                    value = float(item.get("value", 0) or item.get("pnl", 0) or 0)
-                    total += value
-                    log.info("Redeemed %s: +%.2f$", cid[:16], value)
-            except Exception as e:
-                log.warning("Redeem %s failed: %s", cid[:16], e)
-        return total
-    except Exception as e:
-        log.warning("Redeem positions error: %s", e)
-        return 0.0
-
+# Polymarket automatically settles resolved binary option positions to USDC
+# on-chain. The py-clob-client has no redeem_positions method. Manual
+# redemption would require calling the CTF contract directly via web3.
+# sync_wallet_usdc() picks up the settled balance automatically.
 
 def redeem_loop():
-    """Background thread: auto-redeem resolved positions."""
-    from pulse.logger import tg
-    while not SHUTDOWN_EVENT.is_set():
-        try:
-            redeemed = redeem_positions()
-            if redeemed > 0:
-                tg(f"Auto-redeem: +{redeemed:.2f}$")
-        except Exception as e:
-            log.warning("Redeem loop error: %s", e)
-        for _ in range(120):
-            if SHUTDOWN_EVENT.is_set():
-                break
-            time.sleep(1)
+    """No-op: Polymarket auto-settles resolved positions to USDC on-chain."""
+    log.debug("redeem_loop: Polymarket handles settlement automatically")
+    SHUTDOWN_EVENT.wait()
 
 
 # ── Wallet balance ───────────────────────────────────────────────────────────
@@ -439,6 +460,7 @@ def sync_wallet_usdc(force: bool = False) -> float:
 # ── Market fetching ──────────────────────────────────────────────────────────
 _mkt_cache: List = []
 _mkt_cache_lock = threading.Lock()
+_mkt_start_price: Dict[str, float] = {}  # condition_id → BTC price at first parse
 
 
 def parse_ts(s: str) -> Optional[float]:
@@ -486,10 +508,11 @@ def _parse_market(m: dict, now_ts: float) -> Optional[CryptoMarket]:
         log.debug("Market parse error for %s: %s", cid[:16], e)
         return None
     start_time = end_ts - 300
-    # start_price should reflect BTC at market open, not at parse time.
-    # If the market is already underway, FEED.current is a reasonable proxy
-    # but we flag it so window_delta isn't silently wrong on old parses.
-    start_price = FEED.current if FEED.current > 0 else 0.0
+    # start_price: only set on first parse — never overwritten on later prefetch cycles
+    # so window_delta remains consistent across scans for the same market.
+    if cid not in _mkt_start_price and FEED.current > 0:
+        _mkt_start_price[cid] = FEED.current
+    start_price = _mkt_start_price.get(cid, 0.0)
     return CryptoMarket(
         condition_id=cid, question=m.get("question", "")[:55],
         slug=m.get("slug", ""), yes_token=up, no_token=dn,
@@ -502,7 +525,7 @@ def fetch_markets_btc() -> List[CryptoMarket]:
     slug_re = re.compile(BTC_CFG["slug_pattern"], re.IGNORECASE)
     now_ts = time.time()
     out: List[CryptoMarket] = []
-    for off in range(0, 4):
+    for off in range(0, 3):
         slot = int((now_ts // 300 + off) * 300)
         slug = f"btc-updown-5m-{slot}"
         try:

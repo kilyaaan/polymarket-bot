@@ -99,12 +99,14 @@ def compute_score(
     else:
         time_factor = 1.0
 
-    raw = (
+    base = (
         0.45 * mom_score + 0.20 * imb_score + 0.10 * rsi_score
         + 0.15 * wd_score + 0.05 * vol_score
-        + spike_bonus + coh
-    ) * time_factor
-    return round(min(raw, 1.0), 3), mom_score, imb_score
+    )  # sums to [0, 1]
+    # Apply bonuses as multipliers to preserve score resolution above 0.88
+    bonus_mult = 1.0 + spike_bonus + coh   # up to 1.27x
+    raw = min(base * bonus_mult, 1.0) * time_factor
+    return round(raw, 3), mom_score, imb_score
 
 
 # ── Kelly fractional sizing — calibrated ─────────────────────────────────────

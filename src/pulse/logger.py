@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import csv
 import logging
+import queue
+import threading
+import time
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -28,47 +31,153 @@ def setup_logging(level: str = "INFO"):
     logging.getLogger().addHandler(fh)
 
 
+# ── Notification levels ───────────────────────────────────────────────────────
+_LEVELS: dict[str, dict] = {
+    "STARTUP": {"emoji": "🚀", "color": 0xF7931A},
+    "SNIPE":   {"emoji": "🎯", "color": 0xF7931A},
+    "WIN":     {"emoji": "✅", "color": 0x00FF88},
+    "LOSS":    {"emoji": "❌", "color": 0xFF4444},
+    "HOLD":    {"emoji": "🔒", "color": 0x00AAFF},
+    "CIRCUIT": {"emoji": "🛑", "color": 0xFF0000},
+    "RECAP":   {"emoji": "📊", "color": 0x5865F2},
+    "INFO":    {"emoji": "ℹ️",  "color": 0x888888},
+}
+
+# Rate limiting: minimum seconds between notifications per level (0 = unlimited)
+_COOLDOWNS: dict[str, float] = {
+    "SNIPE": 3.0,
+    "HOLD":  10.0,
+    "INFO":  0.0,
+}
+_last_sent: dict[str, float] = {}
+_rate_lock = threading.Lock()
+
+
+def _rate_ok(level: str) -> bool:
+    cd = _COOLDOWNS.get(level, 0.0)
+    if cd == 0.0:
+        return True
+    with _rate_lock:
+        now = time.time()
+        if now - _last_sent.get(level, 0.0) < cd:
+            return False
+        _last_sent[level] = now
+        return True
+
+
 # ── Shared HTTP session ───────────────────────────────────────────────────────
 _notify_session = requests.Session()
 
 
-# ── Telegram ──────────────────────────────────────────────────────────────────
-def _tg(msg: str):
+# ── Formatters ────────────────────────────────────────────────────────────────
+def _fmt_telegram(level: str, title: str, fields: dict) -> str:
+    meta = _LEVELS.get(level, _LEVELS["INFO"])
+    lines = [f"{meta['emoji']} <b>{title}</b>"]
+    for k, v in fields.items():
+        lines.append(f"<b>{k}</b>: <code>{v}</code>")
+    return "\n".join(lines)
+
+
+def _fmt_discord_embed(level: str, title: str, fields: dict) -> dict:
+    meta = _LEVELS.get(level, _LEVELS["INFO"])
+    embed_fields = [
+        {"name": k, "value": str(v), "inline": True}
+        for k, v in fields.items()
+    ]
+    return {
+        "embeds": [{
+            "title": f"{meta['emoji']} {title}",
+            "color": meta["color"],
+            "fields": embed_fields,
+        }]
+    }
+
+
+# ── Senders ───────────────────────────────────────────────────────────────────
+def _send_telegram(level: str, title: str, fields: dict):
     if not TG_TOKEN or not TG_CHAT_ID:
         return
-    try:
-        r = _notify_session.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT_ID, "text": msg},
-            timeout=5,
-        )
-        if r.status_code != 200:
-            log.warning("Telegram send failed: %d", r.status_code)
-    except requests.RequestException as e:
-        log.warning("Telegram error: %s", e)
+    text = _fmt_telegram(level, title, fields)
+    r = _notify_session.post(
+        f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+        json={"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"},
+        timeout=5,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Telegram {r.status_code}")
 
 
-# ── Discord ───────────────────────────────────────────────────────────────────
-def _discord(msg: str):
+def _send_discord(level: str, title: str, fields: dict):
     if not DISCORD_WEBHOOK:
         return
+    payload = _fmt_discord_embed(level, title, fields)
+    r = _notify_session.post(DISCORD_WEBHOOK, json=payload, timeout=5)
+    if r.status_code not in (200, 204):
+        raise RuntimeError(f"Discord {r.status_code}")
+
+
+# ── Async queue + retry worker ────────────────────────────────────────────────
+_notify_queue: queue.Queue = queue.Queue(maxsize=100)
+
+
+def _notify_worker():
+    while True:
+        item = _notify_queue.get()
+        level, title, fields = item
+        for attempt in range(3):
+            try:
+                _send_telegram(level, title, fields)
+                _send_discord(level, title, fields)
+                break
+            except Exception as exc:
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                else:
+                    log.warning("Notify failed after 3 attempts (%s): %s", level, exc)
+        _notify_queue.task_done()
+
+
+_worker_thread = threading.Thread(target=_notify_worker, name="notify_worker", daemon=True)
+_worker_thread.start()
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+def notify(level: str, title: str, **fields):
+    """Send a structured notification to Telegram and/or Discord."""
+    if not _rate_ok(level):
+        return
+    if not TG_TOKEN and not DISCORD_WEBHOOK:
+        return
     try:
-        r = _notify_session.post(
-            DISCORD_WEBHOOK,
-            json={"content": msg},
-            timeout=5,
-        )
-        if r.status_code not in (200, 204):
-            log.warning("Discord send failed: %d", r.status_code)
-    except requests.RequestException as e:
-        log.warning("Discord error: %s", e)
+        _notify_queue.put_nowait((level, title, fields))
+    except queue.Full:
+        log.warning("Notify queue full, dropping %s", level)
 
 
-# ── Unified notify ────────────────────────────────────────────────────────────
-def tg(msg: str):
-    """Send alert to Telegram and/or Discord (whichever is configured)."""
-    _tg(msg)
-    _discord(msg)
+def tg(msg: str, level: str = "INFO"):
+    """Legacy plain-text notification (backward compat). Prefer notify()."""
+    notify(level, msg)
+
+
+# ── Recap ─────────────────────────────────────────────────────────────────────
+def notify_recap(stats: SessionStats):
+    """Send a session summary notification."""
+    # Use stats.total / wins / losses — updated in main.py after every log_trade
+    total = stats.total
+    wr = f"{stats.win_rate:.1f}%" if total else "N/A"
+    pnl_sign = "+" if stats.total_pnl >= 0 else ""
+    notify(
+        "RECAP",
+        "Récap session",
+        **{
+            "Trades": str(total),
+            "Winrate": wr,
+            "P&L net": f"{pnl_sign}{stats.total_pnl:.2f} USDC",
+            "Durée": stats.elapsed,
+            "Snipes": str(stats.snipes),
+            "Spikes vus": str(stats.spikes_seen),
+        },
+    )
 
 
 # ── CSV trade log ─────────────────────────────────────────────────────────────

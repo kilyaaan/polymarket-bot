@@ -31,15 +31,15 @@ MAX_OPEN_POS = 8
 MAX_DIR_POS = 3
 MIN_POS = 3.5
 MAX_POS = 18.0
-SCAN_INTERVAL = 2
+SCAN_INTERVAL = 1
 SYNC_WALLET_EVERY = 5
 
 ENTRY_WINDOW_MIN = 0.3
 ENTRY_WINDOW_MAX = 4.5
 
-TP_DELTA = 0.12
-SL_DELTA = 0.05
-HOLD_THRESHOLD = 0.62
+TP_DELTA = 0.18
+SL_DELTA = 0.08
+HOLD_THRESHOLD = 0.58
 HOLD_MIN_REMAINING = 90.0
 HOLD_ENABLED = True
 
@@ -47,7 +47,7 @@ MIN_ENTRY_PRICE = 0.37
 MAX_ENTRY_PRICE = 0.63
 MAX_SPREAD = 0.03
 TRAILING_STOP = True
-TRAILING_DISTANCE = 0.04
+TRAILING_DISTANCE = 0.06
 
 MAX_DAILY_LOSS = 50.0
 DEFAULT_TAKER_FEE_RATE = 0.02
@@ -128,7 +128,7 @@ class Settings:
     @scan_interval.setter
     def scan_interval(self, val: int):
         with self._lock:
-            self._scan_interval = max(2, val)
+            self._scan_interval = max(1, val)
 
     @property
     def max_daily_loss(self) -> float:
@@ -208,6 +208,7 @@ class Position:
     fee_rate_used: float = DEFAULT_TAKER_FEE_RATE
     close_order_id: str = ""
     close_fill: str = ""
+    sl_order_id: str = ""
     holding_expiry: bool = False
     verified: bool = True
 

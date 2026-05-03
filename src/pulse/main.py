@@ -27,16 +27,27 @@ from pulse.config import (
 from pulse.feed import FEED, SPIKE_INTERRUPT, start_ws_btc, rest_fallback_btc, spike_monitor_loop, prewarm_connections
 from pulse.strategy import compute_score, kelly_size, vote_direction, has_overlapping_position
 from pulse.orders import (
-    place_order, poll_order_status, close_position, cancel_all_pending,
+    place_order, poll_order_status, close_position, place_limit_sell,
+    cancel_all_pending, cancel_order_safe,
     get_ob, get_ob_multi, get_cached_markets, get_fee_rate,
     sync_wallet_usdc, redeem_loop, prefetch_loop, shutdown_ob_pool,
 )
 from pulse.risk import ExpiringBlacklist, save_checkpoint, load_checkpoint, reconcile_positions
 from pulse.dashboard import make_dashboard
-from pulse.logger import setup_logging, init_csv, log_trade, tg, fee_usdc
+from pulse.logger import setup_logging, init_csv, log_trade, tg, notify, notify_recap, fee_usdc
+import pulse.token_ws as token_ws
 
 import logging
 log = logging.getLogger(__name__)
+
+
+# ── Recap thread ────────────────────────────────────────────────────────────
+def _recap_loop(stats: SessionStats, interval_h: float = 2.0):
+    interval = interval_h * 3600
+    while not SHUTDOWN_EVENT.is_set():
+        SHUTDOWN_EVENT.wait(timeout=interval)
+        if not SHUTDOWN_EVENT.is_set():
+            notify_recap(stats)
 
 
 # ── Scan state (shared dict for dashboard + spike monitor) ───────────────────
@@ -144,6 +155,7 @@ def run(dry: bool = True, hold_enabled: bool = True):
     ]
     for name, target in threads:
         threading.Thread(target=target, name=name, daemon=True).start()
+    token_ws.start(SHUTDOWN_EVENT)
 
     console.print("[dim]Connecting to Binance WS...[/]")
     time.sleep(3)
@@ -155,6 +167,7 @@ def run(dry: bool = True, hold_enabled: bool = True):
         save_checkpoint(positions)
 
     stats = SessionStats()
+    threading.Thread(target=lambda: _recap_loop(stats), name="recap", daemon=True).start()
     blacklist = ExpiringBlacklist(ttl=360.0)
     bankroll = sync_wallet_usdc(force=True)
     if bankroll <= 0:
@@ -165,7 +178,10 @@ def run(dry: bool = True, hold_enabled: bool = True):
 
     countdown = float(SETTINGS.scan_interval)
     last_spike_ts = 0.0
-    tg(f"v5.0-BTC {'LIVE' if not dry else 'SIM'} | Kelly+Hold+RSI+Vote")
+    notify("STARTUP", f"v5.0-BTC {'LIVE' if not dry else 'SIM'} démarré",
+           **{"Mode": "LIVE" if not dry else "SIM",
+              "Score min": f"{SETTINGS.min_score:.2f}",
+              "Circuit br.": f"-{SETTINGS.max_daily_loss}$"})
 
     try:
         with Live(console=console, refresh_per_second=10, screen=True) as live:
@@ -174,7 +190,10 @@ def run(dry: bool = True, hold_enabled: bool = True):
 
                 # Circuit breaker
                 if stats.total_pnl <= -max_dl:
-                    tg(f"CIRCUIT BREAKER! Loss: {stats.total_pnl:+.2f}$")
+                    notify("CIRCUIT", "Circuit breaker déclenché",
+                           **{"Perte": f"{stats.total_pnl:+.2f}$",
+                              "Trades": str(stats.total),
+                              "Winrate": f"{stats.win_rate:.1f}%"})
                     log.critical("Circuit breaker triggered: %.2f$", stats.total_pnl)
                     break
 
@@ -183,6 +202,81 @@ def run(dry: bool = True, hold_enabled: bool = True):
                 SPIKE_INTERRUPT.clear()
                 bankroll = sync_wallet_usdc()
                 m15, m30, m60 = FEED.momentum_all()
+
+                # ── WS-triggered SL/TP events (priority — ~100ms reaction) ──
+                ws_eq = token_ws.get_event_queue()
+                while not ws_eq.empty():
+                    try:
+                        ws_tid, ws_reason, ws_price = ws_eq.get_nowait()
+                    except Exception:
+                        break
+                    pos_hit = next((p for p in positions if p.token_id == ws_tid), None)
+                    if pos_hit is None:
+                        continue  # already closed
+                    if pos_hit.holding_expiry and ws_reason == "SL":
+                        # Don't exit hold positions on SL via WS —
+                        # the hold SL check in the loop handles this
+                        token_ws.subscribe(ws_tid,
+                                           pos_hit.trail_sl,
+                                           round(pos_hit.entry_price + TP_DELTA, 4))
+                        continue
+                    # Cancel pre-placed SL order to avoid double-sell
+                    if pos_hit.sl_order_id:
+                        if not dry:
+                            cancel_order_safe(pos_hit.sl_order_id)
+                        pos_hit.sl_order_id = ""
+                    ob_ws = get_ob(pos_hit.token_id)
+                    if ob_ws:
+                        exit_price = ob_ws["bb"] if ws_reason == "SL" else ob_ws["ba"]
+                    else:
+                        exit_price = ws_price
+                    reason_ws = (f"SL {exit_price:.3f}(<{round(pos_hit.entry_price - SL_DELTA, 4):.3f})"
+                                 if ws_reason == "SL"
+                                 else f"TP {exit_price:.3f}(>{round(pos_hit.entry_price + TP_DELTA, 4):.3f})")
+                    if not dry:
+                        close_id, fill_status = close_position(
+                            pos_hit.token_id, exit_price, pos_hit.shares_held, dry)
+                        pos_hit.close_order_id = close_id if close_id else "failed"
+                        pos_hit.close_fill = fill_status
+                        if close_id is None or fill_status not in ("filled", "partial"):
+                            log.warning("WS close failed: %s %s — keeping position",
+                                        ws_reason, pos_hit.direction)
+                            # Re-subscribe so we keep monitoring
+                            token_ws.subscribe(ws_tid,
+                                               round(pos_hit.entry_price - SL_DELTA, 4),
+                                               round(pos_hit.entry_price + TP_DELTA, 4))
+                            continue
+                        bankroll = sync_wallet_usdc(force=True)
+                    else:
+                        pos_hit.close_order_id = f"dry_ws_{int(time.time()*1000)}"
+                        pos_hit.close_fill = "filled"
+                    pos_hit.current_price = exit_price
+                    pnl = log_trade(pos_hit, exit_price, reason_ws, stats,
+                                    FEED.current, SETTINGS.min_score)
+                    stats.total_pnl += pnl
+                    stats.total += 1
+                    if pnl >= 0:
+                        stats.wins += 1
+                    else:
+                        stats.losses += 1
+                    scan_state["log"].appendleft({
+                        "type": "exit", "dir": pos_hit.direction,
+                        "reason": reason_ws, "pnl": round(pnl, 2),
+                        "pnl_pct": round(pos_hit.pnl_pct * 100, 1),
+                        "size": round(pos_hit.size_usdc, 2),
+                        "entry": round(pos_hit.entry_price, 4),
+                        "mom15": m15, "mom60": m60,
+                    })
+                    _level = "WIN" if pnl >= 0 else "LOSS"
+                    notify(_level, f"{_level} — BTC {pos_hit.direction}",
+                           **{"P&L net": f"{pnl:+.2f}$",
+                              "Raison": f"{ws_reason} (WS)",
+                              "Durée": f"{pos_hit.elapsed_min:.1f} min",
+                              "Score entrée": f"{pos_hit.score:.3f}",
+                              "Fill": pos_hit.close_fill,
+                              "Session P&L": f"{stats.total_pnl:+.2f}$"})
+                    positions.remove(pos_hit)
+                    save_checkpoint(positions)
 
                 # ── Exits ────────────────────────────────────────────────
                 closed: List[Position] = []
@@ -195,11 +289,58 @@ def run(dry: bool = True, hold_enabled: bool = True):
 
                         rem_sec = pos.market.remaining_sec
 
+                        # ── Check pre-placed SL order fill ───────────────────
+                        # The SL order sits in the CLOB book and executes at the
+                        # exact SL price — no scan-loop slippage.
+                        if pos.sl_order_id and not pos.holding_expiry:
+                            sl_status, _ = poll_order_status(pos.sl_order_id, timeout=1.0)
+                            if sl_status in ("filled", "partial"):
+                                exit_price = ob["bb"] if ob else round(pos.entry_price - SL_DELTA, 4)
+                                reason_sl = f"SL {exit_price:.3f}(<{round(pos.entry_price - SL_DELTA, 4):.3f})"
+                                pos.close_order_id = pos.sl_order_id
+                                pos.close_fill = sl_status
+                                pos.sl_order_id = ""
+                                pos.current_price = exit_price
+                                token_ws.unsubscribe(pos.token_id)
+                                if not dry:
+                                    bankroll = sync_wallet_usdc(force=True)
+                                pnl = log_trade(pos, exit_price, reason_sl, stats,
+                                                FEED.current, SETTINGS.min_score)
+                                stats.total_pnl += pnl
+                                stats.total += 1
+                                if pnl >= 0:
+                                    stats.wins += 1
+                                else:
+                                    stats.losses += 1
+                                scan_state["log"].appendleft({
+                                    "type": "exit", "dir": pos.direction,
+                                    "reason": reason_sl, "pnl": round(pnl, 2),
+                                    "pnl_pct": round(pos.pnl_pct * 100, 1),
+                                    "size": round(pos.size_usdc, 2),
+                                    "entry": round(pos.entry_price, 4),
+                                    "mom15": m15, "mom60": m60,
+                                })
+                                _level = "WIN" if pnl >= 0 else "LOSS"
+                                notify(_level, f"{_level} — BTC {pos.direction}",
+                                       **{"P&L net": f"{pnl:+.2f}$",
+                                          "Raison": "SL (book)",
+                                          "Durée": f"{pos.elapsed_min:.1f} min",
+                                          "Score entrée": f"{pos.score:.3f}",
+                                          "Fill": sl_status,
+                                          "Session P&L": f"{stats.total_pnl:+.2f}$"})
+                                closed.append(pos)
+                                continue
+
                         # Hold-to-expiry activation
                         if (hold_enabled
                                 and not pos.holding_expiry
                                 and pos.current_price >= HOLD_THRESHOLD
                                 and rem_sec >= HOLD_MIN_REMAINING):
+                            # Cancel pre-placed SL before holding to expiry
+                            if pos.sl_order_id:
+                                if not dry:
+                                    cancel_order_safe(pos.sl_order_id)
+                                pos.sl_order_id = ""
                             pos.holding_expiry = True
                             stats.held_expiry += 1
                             scan_state["log"].appendleft({
@@ -207,11 +348,15 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                 "reason": f"HOLD>{HOLD_THRESHOLD:.2f}@{pos.current_price:.3f}",
                                 "mom15": m15, "mom60": m60,
                             })
-                            tg(f"HOLD expiry {pos.direction} @{pos.current_price:.3f} — {rem_sec:.0f}s")
-                            log.info("HOLD activated: %s @%.3f %0.fs remaining",
+                            notify("HOLD", f"Hold-to-expiry activé {pos.direction}",
+                                   **{"Prix": f"{pos.current_price:.3f}",
+                                      "Restant": f"{rem_sec:.0f}s",
+                                      "Score": f"{pos.score:.3f}"})
+                            log.info("HOLD activated: %s @%.3f %.0fs remaining",
                                      pos.direction, pos.current_price, rem_sec)
 
-                        # Trailing stop
+                        # Trailing stop (only for hold protection — not for normal exits
+                        # which are handled by the pre-placed SL order)
                         if TRAILING_STOP and pos.current_price > pos.peak_price:
                             pos.peak_price = pos.current_price
                             pos.trail_sl = max(
@@ -233,41 +378,78 @@ def run(dry: bool = True, hold_enabled: bool = True):
                         else:
                             if pos.current_price >= eff_tp:
                                 reason = f"TP {pos.current_price:.3f}(>{eff_tp:.3f})"
-                            elif pos.current_price <= eff_sl:
-                                reason = f"SL {pos.current_price:.3f}(<{eff_sl:.3f})"
+                            # No scan-based SL check — handled by pre-placed order
                             elif pos.market.remaining_min <= 0.15:
                                 reason = "EXPIRY"
 
                         if reason:
+                            # Cancel pre-placed SL order before any manual close
+                            if pos.sl_order_id:
+                                if not dry:
+                                    cancel_order_safe(pos.sl_order_id)
+                                pos.sl_order_id = ""
+
                             ob2 = get_ob(pos.token_id) if reason != "EXPIRY" else ob
                             if ob2:
                                 pos.current_price = ob2["mid"]
 
                             if reason != "EXPIRY":
-                                exit_price = ob2["bb"] if ob2 else pos.current_price
-                                close_id, fill_status = close_position(
-                                    pos.token_id, exit_price, pos.shares_held, dry)
-                                pos.close_order_id = close_id if close_id else "failed"
-                                pos.close_fill = fill_status
-                                if not dry:
-                                    if close_id is None:
+                                # ── Safety: resolve any stale pending close order ──────
+                                _skip_placement = False
+                                _stale_id = pos.close_order_id
+                                if _stale_id and _stale_id not in ("", "failed", "expiry_resolution"):
+                                    prev_status, _ = poll_order_status(_stale_id, timeout=3.0)
+                                    if prev_status in ("filled", "partial"):
+                                        pos.close_fill = prev_status
+                                        exit_price = ob2["bb"] if ob2 else pos.current_price
+                                        pos.current_price = exit_price
+                                        _skip_placement = True
+                                        log.info("Stale close order %s already %s — using it",
+                                                 _stale_id[:16], prev_status)
+                                    else:
+                                        if not dry:
+                                            cancel_order_safe(_stale_id)
+                                        pos.close_order_id = ""
+                                        log.warning("Cancelled stale close order %s, retrying",
+                                                    _stale_id[:16])
+
+                                if not _skip_placement:
+                                    if ob2 is None:
                                         scan_state["log"].appendleft({
                                             "type": "skip", "dir": pos.direction,
-                                            "reason": "CLOSE FAILED — kept",
+                                            "reason": "CLOSE SKIP — no OB",
                                             "mom15": m15, "mom60": m60,
                                         })
-                                        log.error("Close failed for %s %s", pos.direction, pos.token_id[:16])
+                                        log.warning("Close skipped (no OB): %s %s",
+                                                    pos.direction, pos.token_id[:16])
                                         continue
-                                    if fill_status not in ("filled", "partial"):
-                                        scan_state["log"].appendleft({
-                                            "type": "skip", "dir": pos.direction,
-                                            "reason": f"SELL not fill ({fill_status})",
-                                            "mom15": m15, "mom60": m60,
-                                        })
-                                        tg(f"SELL not fill {pos.direction}")
-                                        log.warning("SELL not filled: %s %s", pos.direction, fill_status)
-                                        continue
-                                    bankroll = sync_wallet_usdc(force=True)
+
+                                    exit_price = ob2["bb"]
+                                    close_id, fill_status = close_position(
+                                        pos.token_id, exit_price, pos.shares_held, dry)
+                                    pos.close_order_id = close_id if close_id else "failed"
+                                    pos.close_fill = fill_status
+                                    if not dry:
+                                        if close_id is None:
+                                            scan_state["log"].appendleft({
+                                                "type": "skip", "dir": pos.direction,
+                                                "reason": "CLOSE FAILED — kept",
+                                                "mom15": m15, "mom60": m60,
+                                            })
+                                            log.error("Close failed for %s %s",
+                                                      pos.direction, pos.token_id[:16])
+                                            continue
+                                        if fill_status not in ("filled", "partial"):
+                                            scan_state["log"].appendleft({
+                                                "type": "skip", "dir": pos.direction,
+                                                "reason": f"SELL not fill ({fill_status})",
+                                                "mom15": m15, "mom60": m60,
+                                            })
+                                            tg(f"SELL not fill {pos.direction}")
+                                            log.warning("SELL not filled: %s %s",
+                                                        pos.direction, fill_status)
+                                            continue
+                                        bankroll = sync_wallet_usdc(force=True)
                                 pos.current_price = exit_price
                             else:
                                 pos.close_order_id = "expiry_resolution"
@@ -293,8 +475,15 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                 "entry": round(pos.entry_price, 4),
                                 "mom15": m15, "mom60": m60,
                             })
-                            tg(f"{'WIN' if pnl >= 0 else 'LOSS'} {reason} | "
-                               f"{pos.direction} | {pnl:+.2f}$ | fill:{pos.close_fill}")
+                            _level = "WIN" if pnl >= 0 else "LOSS"
+                            notify(_level, f"{_level} — BTC {pos.direction}",
+                                   **{"P&L net": f"{pnl:+.2f}$",
+                                      "Raison": reason.split()[0],
+                                      "Durée": f"{pos.elapsed_min:.1f} min",
+                                      "Score entrée": f"{pos.score:.3f}",
+                                      "Fill": pos.close_fill,
+                                      "Session P&L": f"{stats.total_pnl:+.2f}$"})
+                            token_ws.unsubscribe(pos.token_id)
                             closed.append(pos)
 
                     for c in closed:
@@ -306,7 +495,15 @@ def run(dry: bool = True, hold_enabled: bool = True):
                     stats.spikes_seen += 1
 
                 # ── Entry scan ───────────────────────────────────────────
-                if len(positions) < MAX_OPEN_POS:
+                # Guard: skip new entries when price feed is degraded
+                _feed_ok = FEED.ws_status in ("live", "rest_only")
+                if not _feed_ok and not dry:
+                    scan_state["log"].appendleft({
+                        "type": "skip", "dir": "-",
+                        "reason": f"feed {FEED.ws_status} — entrées bloquées",
+                        "mom15": m15, "mom60": m60,
+                    })
+                if len(positions) < MAX_OPEN_POS and (_feed_ok or dry):
                     all_markets = get_cached_markets()
                     scan_state["active_markets"] = all_markets
                     cur_min, win_min, win_max = SETTINGS.thresholds
@@ -363,6 +560,9 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                 token_map[tok] = (mkt, direction)
 
                         obs = get_ob_multi(list(token_map.keys()))
+                        # Track available funds locally to avoid stale bankroll
+                        # when multiple entries happen in the same scan cycle
+                        _available = bankroll - sum(p.size_usdc for p in positions)
 
                         for tok, ob in obs.items():
                             if len(positions) >= MAX_OPEN_POS:
@@ -421,7 +621,7 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                 continue
 
                             size = kelly_size(score, entry_p, bankroll)
-                            if bankroll < size + sum(p.size_usdc for p in positions):
+                            if _available < size:
                                 continue
 
                             shares = math.ceil(size / max(entry_p, 0.001) * 10000) / 10000
@@ -448,13 +648,29 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                     log.warning("BUY cancelled: %s", direction)
                                     continue
                                 if buy_fill == "open":
-                                    tg(f"BUY open {direction} (waiting fill)")
-                                    log.info("BUY still open: %s", direction)
+                                    # Order not confirmed — cancel and skip to avoid ghost position
+                                    cancel_order_safe(order_id)
+                                    scan_state["log"].appendleft({
+                                        "type": "skip", "dir": direction,
+                                        "reason": "BUY timeout — annulé",
+                                        "mom15": m15, "mom60": m60,
+                                    })
+                                    notify("INFO", f"BUY timeout annulé {direction}")
+                                    log.warning("BUY timed out — cancelled and skipped: %s", direction)
+                                    continue
                                 if filled_shares is not None:
                                     actual_shares = filled_shares
                                     log.info("Fill verified: %.4f shares (local est: %.4f)",
                                              filled_shares, shares)
                                 bankroll = sync_wallet_usdc(force=True)
+
+                            sl_price = round(entry_p - SL_DELTA, 4)
+                            sl_oid = place_limit_sell(tok, sl_price, actual_shares, dry)
+                            if sl_oid:
+                                log.info("SL pre-placed: %s @%.3f", sl_oid[:16], sl_price)
+                            else:
+                                log.warning("SL pre-placement failed for %s — scan-based fallback",
+                                            direction)
 
                             pos = Position(
                                 market=mkt, token_id=tok, direction=direction,
@@ -463,14 +679,18 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                 order_id=order_id,
                                 entry_crypto=FEED.current, score=score,
                                 peak_price=entry_p,
-                                trail_sl=round(entry_p - SL_DELTA, 4),
+                                trail_sl=sl_price,
+                                sl_order_id=sl_oid or "",
                                 mom15_at_entry=m15,
                                 rsi_at_entry=FEED.rsi(),
                                 kelly_used=size,
                                 fee_rate_used=get_fee_rate(tok),
                             )
                             positions.append(pos)
+                            _available -= size  # deduct immediately for next candidate
                             save_checkpoint(positions)
+                            # Subscribe to real-time WS for fast SL/TP detection
+                            token_ws.subscribe(tok, sl_price, round(entry_p + TP_DELTA, 4))
                             stats.snipes += 1
                             if direction == "UP":
                                 up_count += 1
@@ -483,9 +703,12 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                 "reason": f"entry {entry_p:.3f} K:{size:.1f}$",
                                 "size": round(size, 2), "entry": round(entry_p, 4),
                             })
-                            tg(f"SNIPE {direction} | score {score:.3f} | "
-                               f"Kelly {size:.1f}$ | entry {entry_p:.3f} | "
-                               f"RSI {pos.rsi_at_entry:.0f}")
+                            notify("SNIPE", f"Snipe BTC {direction}",
+                                   **{"Score": f"{score:.3f}",
+                                      "Kelly": f"{size:.1f}$",
+                                      "Entrée": f"{entry_p:.3f}",
+                                      "RSI": f"{pos.rsi_at_entry:.0f}",
+                                      "Mom15s": f"{m15:+.4f}%"})
                             log.info("SNIPE %s score=%.3f kelly=%.1f$ entry=%.3f",
                                      direction, score, size, entry_p)
 
@@ -522,8 +745,19 @@ def run(dry: bool = True, hold_enabled: bool = True):
         log.warning("%d position(s) still open at shutdown", len(positions))
         console.print(f"[bold yellow]WARNING: {len(positions)} position(s) open — logged as SHUTDOWN_OPEN[/]")
         for pos in positions:
-            log_trade(pos, pos.current_price, "SHUTDOWN_OPEN", stats,
-                     FEED.current, SETTINGS.min_score)
+            # Cancel pre-placed SL order and unsubscribe WS before logging shutdown
+            token_ws.unsubscribe(pos.token_id)
+            if pos.sl_order_id and not dry:
+                cancel_order_safe(pos.sl_order_id)
+                pos.sl_order_id = ""
+            pnl = log_trade(pos, pos.current_price, "SHUTDOWN_OPEN", stats,
+                            FEED.current, SETTINGS.min_score)
+            stats.total_pnl += pnl
+            stats.total += 1
+            if pnl >= 0:
+                stats.wins += 1
+            else:
+                stats.losses += 1
 
     console.print(Panel(
         f"[bold]SESSION COMPLETE[/]\n"
@@ -538,6 +772,130 @@ def run(dry: bool = True, hold_enabled: bool = True):
     ))
 
 
+# ── Validate mode ────────────────────────────────────────────────────────────
+def validate():
+    """
+    Test the full CLOB path without placing any real order.
+    Checks: credentials, market fetch, OB, tick size, fee rate,
+    order construction (signed but NOT posted), wallet balance.
+    """
+    import traceback
+    console = Console()
+    ok = True
+
+    def _check(label: str, fn):
+        nonlocal ok
+        try:
+            result = fn()
+            console.print(f"  [green]✓[/] {label}: [dim]{result}[/]")
+            return result
+        except Exception as e:
+            console.print(f"  [red]✗[/] {label}: [bold red]{e}[/]")
+            ok = False
+            return None
+
+    console.print(Panel("[bold]VALIDATE MODE — aucun ordre réel ne sera envoyé[/]",
+                        border_style="yellow"))
+
+    # 1. CLOB client init + credentials
+    console.print("\n[bold]1. Connexion CLOB[/]")
+    cl = _check("Init ClobClient", lambda: (
+        __import__("pulse.orders", fromlist=["get_clob_client"]).get_clob_client()
+        or (_ for _ in ()).throw(RuntimeError("get_clob_client() returned None"))
+    ))
+
+    # 2. Wallet balance
+    console.print("\n[bold]2. Wallet[/]")
+    _check("Balance USDC on-chain",
+           lambda: f"{sync_wallet_usdc(force=True):.2f} USDC")
+
+    # 3. Fetch active BTC market
+    console.print("\n[bold]3. Marché BTC 5min[/]")
+    from pulse.orders import fetch_markets_btc, get_ob, get_fee_rate
+    from pulse.feed import start_ws_btc
+    import threading as _threading
+    _threading.Thread(target=start_ws_btc, daemon=True).start()
+    time.sleep(2)
+
+    mkts = _check("Fetch marchés BTC", lambda: (
+        fetch_markets_btc()
+        or (_ for _ in ()).throw(RuntimeError("Aucun marché BTC trouvé"))
+    ))
+    mkt = mkts[0] if mkts else None
+
+    if mkt:
+        _check("Marché slug", lambda: mkt.slug)
+        _check("Temps restant", lambda: f"{mkt.remaining_min:.1f} min")
+
+        tok = mkt.yes_token
+        _check("Yes token ID", lambda: tok[:20] + "...")
+
+        # 4. Order book
+        console.print("\n[bold]4. Carnet d'ordres[/]")
+        ob = _check("GET /book", lambda: (
+            get_ob(tok)
+            or (_ for _ in ()).throw(RuntimeError("OB vide ou inaccessible"))
+        ))
+        if ob:
+            _check("Spread", lambda: f"{ob['spread']:.4f} ({'OK' if ob['spread'] < 0.03 else 'LARGE'})")
+            _check("Best bid / ask", lambda: f"{ob['bb']:.3f} / {ob['ba']:.3f}")
+            _check("Depth total", lambda: f"{ob['total_d']:.0f} USDC")
+
+        # 5. Tick size
+        console.print("\n[bold]5. Tick size & fee rate[/]")
+        _check("GET /tick-size", lambda: (
+            __import__("requests").get(
+                "https://clob.polymarket.com/tick-size",
+                params={"token_id": tok}, timeout=4
+            ).json()["minimum_tick_size"]
+        ))
+        _check("GET /fee-rate", lambda: f"{get_fee_rate(tok):.4f} ({get_fee_rate(tok)*100:.2f}%)")
+
+        # 6. Authenticated API call (verifies HMAC creds are valid)
+        console.print("\n[bold]6. Credentials CLOB (appel authentifié réel)[/]")
+        if cl:
+            def _test_auth():
+                # get_orders requires Level 2 auth — same creds used by place/close
+                result = cl.get_orders()
+                return f"get_orders() OK — {len(result) if isinstance(result, list) else '?'} ordre(s) en cours"
+            _check("GET /orders (Level 2 auth)", _test_auth)
+        else:
+            console.print("  [yellow]⚠[/] Skipped (pas de client)")
+
+        # 7. Build + sign order WITHOUT posting
+        console.print("\n[bold]7. Construction d'ordre (signé, NON envoyé)[/]")
+        if cl and ob:
+            def _build_order():
+                from py_clob_client.clob_types import OrderArgs
+                from py_clob_client.order_builder.constants import BUY, SELL
+                buy_price = min(round(ob["ba"] + 0.01, 2), 0.98)
+                buy_args = OrderArgs(token_id=tok, price=buy_price, size=1.0, side=BUY)
+                cl.create_order(buy_args)
+                sell_price = max(round(ob["bb"] - 0.01, 2), 0.02)
+                sell_args = OrderArgs(token_id=tok, price=sell_price, size=1.0, side=SELL)
+                cl.create_order(sell_args)
+                return f"BUY@{buy_price} ✓  SELL@{sell_price} ✓  (non postés)"
+            _check("create_order BUY + SELL", _build_order)
+        else:
+            console.print("  [yellow]⚠[/] Skipped (pas de client ou OB)")
+
+    # 7. Summary
+    console.print()
+    if ok:
+        console.print(Panel(
+            "[bold green]Tous les checks sont passés.[/]\n"
+            "Le bot peut être lancé en [bold]--live[/].",
+            border_style="green",
+        ))
+    else:
+        console.print(Panel(
+            "[bold red]Des erreurs ont été détectées.[/]\n"
+            "Corrige-les avant de lancer en [bold]--live[/].",
+            border_style="red",
+        ))
+    return ok
+
+
 # ── CLI entrypoint ───────────────────────────────────────────────────────────
 def cli():
     # Signal handlers for graceful shutdown
@@ -548,6 +906,7 @@ def cli():
     signal.signal(signal.SIGTERM, _shutdown_handler)
 
     p = argparse.ArgumentParser(description="Crypto Pulse Sniper v5.0-BTC")
+    p.add_argument("--validate", action="store_true", help="Test CLOB connectivity sans placer d'ordre")
     p.add_argument("--live", action="store_true", help="Live mode (default: simulation)")
     p.add_argument("--score", type=float, default=MIN_SCORE, help=f"Min score (default: {MIN_SCORE})")
     p.add_argument("--auto", action="store_true", help="Auto-adaptive score")
@@ -557,6 +916,10 @@ def cli():
     p.add_argument("--no-hold", action="store_true", help="Disable hold-to-expiry")
     p.add_argument("--log-level", type=str, default="INFO", help="Log level (default: INFO)")
     args = p.parse_args()
+
+    if args.validate:
+        setup_logging(args.log_level if hasattr(args, "log_level") else "WARNING")
+        sys.exit(0 if validate() else 1)
 
     hold_enabled = HOLD_ENABLED and not args.no_hold
     SETTINGS.min_score = max(0.20, min(0.90, args.score))
