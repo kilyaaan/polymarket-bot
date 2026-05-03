@@ -1,0 +1,20 @@
+# Secrets — ne jamais commiter
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Runtime
+*.log
+positions.json
+*.json.tmp
+
+# OS
+.DS_Store
+Thumbs.db

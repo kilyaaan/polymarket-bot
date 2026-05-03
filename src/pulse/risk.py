@@ -155,8 +155,12 @@ def reconcile_positions(positions: List[Position]) -> List[Position]:
                 now - pos.market.end_time,
             )
             from pulse.logger import tg, log_trade
-            from pulse.config import SessionStats
+            from pulse.config import SessionStats, SETTINGS
             stats = SessionStats()
+            pos.close_order_id = "missed_expiry"
+            pos.close_fill = "missed_expiry"
+            log_trade(pos, pos.current_price or pos.entry_price,
+                      "MISSED_EXPIRY", stats, 0.0, SETTINGS.min_score)
             tg(f"MISSED_EXPIRY: {pos.direction} {pos.market.question}")
             continue
         pos.verified = False

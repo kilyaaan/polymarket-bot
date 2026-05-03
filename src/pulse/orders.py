@@ -342,37 +342,35 @@ def redeem_positions() -> float:
     if cl is None:
         return 0.0
     try:
-        api_key = os.getenv("CLOB_API_KEY", "").strip()
-        api_sec = os.getenv("CLOB_SECRET", "").strip()
-        api_pass = os.getenv("CLOB_PASSPHRASE", "").strip()
-        if not (api_key and api_sec and api_pass):
+        # Use the CLOB client's authenticated method to fetch redeemable positions.
+        # py_clob_client uses L1/L2 HMAC signatures — Bearer token is incorrect here.
+        get_pos = getattr(cl, "get_positions", None)
+        if get_pos is None:
+            log.debug("CLOB client has no get_positions method — skipping redeem")
             return 0.0
-        r = _get_http().get(
-            f"{HOST}/positions",
-            params={"redeemable": "true"},
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=5,
-        )
-        if r.status_code != 200:
-            return 0.0
-        data = r.json()
-        if not data:
-            return 0.0
+        positions_data = get_pos() or []
+        if not isinstance(positions_data, list):
+            positions_data = positions_data.get("data") or []
         total = 0.0
-        for item in data:
+        for item in positions_data:
+            # Only redeem positions that are resolved/redeemable
+            redeemable = item.get("redeemable") or item.get("can_redeem")
+            if not redeemable:
+                continue
             cid = item.get("condition_id") or item.get("conditionId")
             if not cid:
                 continue
             try:
                 resp = cl.redeem_positions({"conditionId": cid})
                 if resp:
-                    total += float(item.get("value", 0) or 0)
-                    log.info("Redeemed %s: +%.2f$", cid[:16], float(item.get("value", 0) or 0))
+                    value = float(item.get("value", 0) or item.get("pnl", 0) or 0)
+                    total += value
+                    log.info("Redeemed %s: +%.2f$", cid[:16], value)
             except Exception as e:
                 log.warning("Redeem %s failed: %s", cid[:16], e)
         return total
     except Exception as e:
-        log.warning("Redeem loop error: %s", e)
+        log.warning("Redeem positions error: %s", e)
         return 0.0
 
 
@@ -487,11 +485,16 @@ def _parse_market(m: dict, now_ts: float) -> Optional[CryptoMarket]:
     except Exception as e:
         log.debug("Market parse error for %s: %s", cid[:16], e)
         return None
+    start_time = end_ts - 300
+    # start_price should reflect BTC at market open, not at parse time.
+    # If the market is already underway, FEED.current is a reasonable proxy
+    # but we flag it so window_delta isn't silently wrong on old parses.
+    start_price = FEED.current if FEED.current > 0 else 0.0
     return CryptoMarket(
         condition_id=cid, question=m.get("question", "")[:55],
         slug=m.get("slug", ""), yes_token=up, no_token=dn,
-        start_time=end_ts - 300, end_time=end_ts,
-        start_price=FEED.current,
+        start_time=start_time, end_time=end_ts,
+        start_price=start_price,
     )
 
 

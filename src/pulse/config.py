@@ -23,6 +23,8 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 TG_TOKEN = os.getenv("TG_TOKEN", "")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
+
 # ── Trading parameters ───────────────────────────────────────────────────────
 BANKROLL = 200.0
 MAX_OPEN_POS = 8

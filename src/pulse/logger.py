@@ -1,4 +1,4 @@
-"""Logging — structured logging, CSV trade writer, Telegram notifier."""
+"""Logging — structured logging, CSV trade writer, Telegram & Discord notifier."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 import requests
 
-from pulse.config import TG_TOKEN, TG_CHAT_ID, TRADES_CSV, DEFAULT_TAKER_FEE_RATE
+from pulse.config import TG_TOKEN, TG_CHAT_ID, DISCORD_WEBHOOK, TRADES_CSV, DEFAULT_TAKER_FEE_RATE
 
 if TYPE_CHECKING:
     from pulse.config import Position, SessionStats
@@ -28,16 +28,16 @@ def setup_logging(level: str = "INFO"):
     logging.getLogger().addHandler(fh)
 
 
-# ── Telegram ─────────────────────────────────────────────────────────────────
-_tg_session = requests.Session()
+# ── Shared HTTP session ───────────────────────────────────────────────────────
+_notify_session = requests.Session()
 
 
-def tg(msg: str):
-    """Send a Telegram alert. Failures are logged, never swallowed."""
+# ── Telegram ──────────────────────────────────────────────────────────────────
+def _tg(msg: str):
     if not TG_TOKEN or not TG_CHAT_ID:
         return
     try:
-        r = _tg_session.post(
+        r = _notify_session.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
             json={"chat_id": TG_CHAT_ID, "text": msg},
             timeout=5,
@@ -48,7 +48,30 @@ def tg(msg: str):
         log.warning("Telegram error: %s", e)
 
 
-# ── CSV trade log ────────────────────────────────────────────────────────────
+# ── Discord ───────────────────────────────────────────────────────────────────
+def _discord(msg: str):
+    if not DISCORD_WEBHOOK:
+        return
+    try:
+        r = _notify_session.post(
+            DISCORD_WEBHOOK,
+            json={"content": msg},
+            timeout=5,
+        )
+        if r.status_code not in (200, 204):
+            log.warning("Discord send failed: %d", r.status_code)
+    except requests.RequestException as e:
+        log.warning("Discord error: %s", e)
+
+
+# ── Unified notify ────────────────────────────────────────────────────────────
+def tg(msg: str):
+    """Send alert to Telegram and/or Discord (whichever is configured)."""
+    _tg(msg)
+    _discord(msg)
+
+
+# ── CSV trade log ─────────────────────────────────────────────────────────────
 _CSV_COLUMNS = [
     "timestamp", "direction", "entry", "exit", "shares_held",
     "size_usdc", "kelly_used", "pnl_gross", "pnl_net", "pnl_pct",
