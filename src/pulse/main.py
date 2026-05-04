@@ -378,7 +378,10 @@ def run(dry: bool = True, hold_enabled: bool = True):
                         else:
                             if pos.current_price >= eff_tp:
                                 reason = f"TP {pos.current_price:.3f}(>{eff_tp:.3f})"
-                            # No scan-based SL check — handled by pre-placed order
+                            elif pos.current_price <= eff_sl:
+                                # Fallback SL — fires when WS missed the event or
+                                # pre-placed order didn't fill (e.g. no buyer / sim mode)
+                                reason = f"SL {pos.current_price:.3f}(<{eff_sl:.3f})"
                             elif pos.market.remaining_min <= 0.15:
                                 reason = "EXPIRY"
 
