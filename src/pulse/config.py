@@ -73,7 +73,12 @@ BTC_CFG = {
 }
 
 # ── Paths ────────────────────────────────────────────────────────────────────
-TRADES_CSV = Path("crypto_trades_btc_v5.csv")
+def _session_csv() -> Path:
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return Path(f"crypto_trades_btc_v5_{ts}.csv")
+
+TRADES_CSV = _session_csv()
 POSITIONS_CHECKPOINT = Path("positions.json")
 
 # ── Shutdown event (shared across all modules) ───────────────────────────────
