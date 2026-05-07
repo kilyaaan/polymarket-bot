@@ -60,10 +60,13 @@ def make_dashboard(
     cb_warn = stats.total_pnl <= -(max_dl * 0.7)
     rsi_c = "bold green" if rsi_v > RSI_OVERBOUGHT else ("bold red" if rsi_v < RSI_OVERSOLD else "dim")
 
+    macro = FEED.macro_trend()
+    macro_c = "green" if macro == "UP" else ("red" if macro == "DOWN" else "dim")
+
     # Header
     layout["header"].update(Panel(
         Text.assemble(
-            (" CRYPTO PULSE v5.0-BTC ", "bold #f7931a"),
+            (" CRYPTO PULSE v5.1-BTC ", "bold #f7931a"),
             (" | scan #", "dim"), (str(stats.scans), "white"),
             (" | ", "dim"), (stats.elapsed, "yellow"),
             (" | next: ", "dim"), (f"{int(countdown)}s", "bold cyan"),
@@ -71,6 +74,7 @@ def make_dashboard(
             (" | WS:", "dim"), (ws_st[:4], ws_col),
             (f" {FEED.latency:.0f}ms {FEED.ticks_per_sec()}t/s", "dim"),
             (" | RSI:", "dim"), (f"{rsi_v:.0f}", rsi_c),
+            (" | macro:", "dim"), (macro, macro_c),
             (" | CB:", "dim"), (f"{stats.total_pnl:+.1f}$/{-max_dl:.0f}$",
                                 "bold red" if cb_warn else "dim"),
         ),
@@ -101,7 +105,8 @@ def make_dashboard(
     spike_str = "[bold yellow blink]SPIKE[/]" if spk_now else ""
     price_tbl.add_row(f"[bold]NOW ${cur:,.2f}[/]", spike_str)
     price_tbl.add_row(f"[dim]15s [{m15c}]{m15:+.4f}%[/]", f"[dim]30s [{m30c}]{m30:+.4f}%[/]")
-    price_tbl.add_row(f"[dim]60s [{m60c}]{m60:+.4f}%[/]", f"[dim]RSI [{rsi_c}]{rsi_v:.1f}[/]")
+    price_tbl.add_row(f"[dim]60s [{m60c}]{m60:+.4f}%[/]",
+                      f"[dim]RSI [bold {rsi_c}]{rsi_v:.1f}[/][dim] veto<{RSI_OVERSOLD:.0f}/{RSI_OVERBOUGHT:.0f}[/]")
     wd_disp = 0.0
     if active_markets:
         sp = active_markets[0].start_price
@@ -112,6 +117,7 @@ def make_dashboard(
                       f"[dim]best: [cyan]{best_score:.3f}[/][/]")
     price_tbl.add_row(f"[dim]mkts: {len(active_markets)}[/]",
                       f"[dim]edge~: [yellow]{avg_edge:.3f}[/][/]")
+    price_tbl.add_row(f"[dim]macro: [{macro_c}]{macro}[/][/]", "")
     layout["feed"].update(Panel(price_tbl, title="[bold #f7931a]BTC/USDT[/]",
                                 border_style="#f7931a", style="on #080a0c"))
 
@@ -268,9 +274,10 @@ def make_dashboard(
             f" TP:+{TP_DELTA:.0%} SL:-{SL_DELTA:.0%} Trail:{TRAILING_DISTANCE}"
             f" | Hold>{HOLD_THRESHOLD:.2f}@{HOLD_MIN_REMAINING:.0f}s"
             f" | Entry:{MIN_ENTRY_PRICE:.2f}-{MAX_ENTRY_PRICE:.2f}"
+            f" | Win:{ENTRY_WINDOW_MIN}-{ENTRY_WINDOW_MAX}min"
             f" | Spike:>{SPIKE_THRESHOLD:.2%}"
-            f" | Window:{ENTRY_WINDOW_MIN}-{ENTRY_WINDOW_MAX}min"
-            f" | Scan:{si}s CB:-{max_dl:.0f}$ | v5.0-BTC",
+            f" | OB gate:58%/65%"
+            f" | Scan:{si}s CB:-{max_dl:.0f}$ | [bold #f7931a]v5.1-BTC[/]",
         ),
         style="on #080a0c", border_style="#1a2030",
     ))
