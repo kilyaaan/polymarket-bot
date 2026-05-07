@@ -106,7 +106,7 @@ def make_dashboard(
     price_tbl.add_row(f"[bold]NOW ${cur:,.2f}[/]", spike_str)
     price_tbl.add_row(f"[dim]15s [{m15c}]{m15:+.4f}%[/]", f"[dim]30s [{m30c}]{m30:+.4f}%[/]")
     price_tbl.add_row(f"[dim]60s [{m60c}]{m60:+.4f}%[/]",
-                      f"[dim]RSI [bold {rsi_c}]{rsi_v:.1f}[/][dim] veto<{RSI_OVERSOLD:.0f}/{RSI_OVERBOUGHT:.0f}[/]")
+                      f"[dim]RSI [{rsi_c}]{rsi_v:.1f}[/] [dim]veto<{RSI_OVERSOLD:.0f}>{RSI_OVERBOUGHT:.0f}[/]")
     wd_disp = 0.0
     if active_markets:
         sp = active_markets[0].start_price
@@ -271,13 +271,14 @@ def make_dashboard(
 
     layout["footer"].update(Panel(
         Text.assemble(
-            f" TP:+{TP_DELTA:.0%} SL:-{SL_DELTA:.0%} Trail:{TRAILING_DISTANCE}"
-            f" | Hold>{HOLD_THRESHOLD:.2f}@{HOLD_MIN_REMAINING:.0f}s"
-            f" | Entry:{MIN_ENTRY_PRICE:.2f}-{MAX_ENTRY_PRICE:.2f}"
-            f" | Win:{ENTRY_WINDOW_MIN}-{ENTRY_WINDOW_MAX}min"
-            f" | Spike:>{SPIKE_THRESHOLD:.2%}"
-            f" | OB gate:58%/65%"
-            f" | Scan:{si}s CB:-{max_dl:.0f}$ | [bold #f7931a]v5.1-BTC[/]",
+            (f" TP:+{TP_DELTA:.0%} SL:-{SL_DELTA:.0%} Trail:{TRAILING_DISTANCE}"
+             f" | Hold>{HOLD_THRESHOLD:.2f}@{HOLD_MIN_REMAINING:.0f}s"
+             f" | Entry:{MIN_ENTRY_PRICE:.2f}-{MAX_ENTRY_PRICE:.2f}"
+             f" | Win:{ENTRY_WINDOW_MIN}-{ENTRY_WINDOW_MAX}min"
+             f" | Spike:>{SPIKE_THRESHOLD:.2%}"
+             f" | OB gate:58/65%"
+             f" | Scan:{si}s CB:-{max_dl:.0f}$ | ", "dim"),
+            ("v5.1-BTC", "bold #f7931a"),
         ),
         style="on #080a0c", border_style="#1a2030",
     ))
