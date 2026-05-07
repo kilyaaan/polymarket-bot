@@ -164,6 +164,34 @@ class BTCFeed:
             return 100.0
         return round(100.0 - 100.0 / (1.0 + avg_g / avg_l), 2)
 
+    def macro_trend(self, window_sec: float = 300.0) -> str:
+        """
+        Direction of the last completed ~5-minute window.
+
+        Compares price ~300s ago to price ~60s ago so we capture the prior
+        completed window without contaminating it with the current partial window.
+
+        Returns 'UP', 'DOWN', or 'NEUTRAL' (insufficient data or flat move).
+        """
+        ts, px = self._snapshot()
+        if len(ts) < 4:
+            return "NEUTRAL"
+        now = time.monotonic()
+        i_start = np.searchsorted(ts, now - window_sec, side="left")
+        i_end = np.searchsorted(ts, now - 60.0, side="left")
+        if i_start >= len(ts) or i_end >= len(ts) or i_end <= i_start:
+            return "NEUTRAL"
+        p_start = px[i_start]
+        p_end = px[i_end]
+        if p_start == 0:
+            return "NEUTRAL"
+        delta = (p_end - p_start) / p_start * 100
+        if delta > 0.02:
+            return "UP"
+        elif delta < -0.02:
+            return "DOWN"
+        return "NEUTRAL"
+
     def ticks_per_sec(self) -> int:
         now = time.monotonic()
         with self._lock:

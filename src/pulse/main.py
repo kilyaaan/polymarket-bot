@@ -21,6 +21,7 @@ from pulse.config import (
     SPIKE_THRESHOLD, MIN_ENTRY_PRICE, MAX_ENTRY_PRICE, MAX_SPREAD,
     MIN_MOM_GLOBAL, TP_DELTA, SL_DELTA, TRAILING_STOP, TRAILING_DISTANCE,
     HOLD_THRESHOLD, HOLD_MIN_REMAINING, HOLD_ENABLED, RSI_PERIOD,
+    RSI_OVERBOUGHT, RSI_OVERSOLD,
     TRADES_CSV, POSITIONS_CHECKPOINT,
     Position, SessionStats,
 )
@@ -127,15 +128,16 @@ def run(dry: bool = True, hold_enabled: bool = True):
         time.sleep(2)
 
     console.print(Panel(
-        f"[bold #f7931a]CRYPTO PULSE SNIPER v5.0-BTC[/]\n"
+        f"[bold #f7931a]CRYPTO PULSE SNIPER v5.1-BTC[/]\n"
         f"Mode        : {'[bold red]LIVE[/]' if not dry else '[bold cyan]SIMULATION[/]'}\n"
         f"Score min   : [bold]{SETTINGS.min_score:.2f}[/]\n"
         f"Kelly 1/4   : [bold green]ON[/] (calibrated from CSV)\n"
         f"Hold-expiry : [bold green]{'ON' if hold_enabled else 'OFF'}[/]"
         f" (>{HOLD_THRESHOLD:.2f} with >{HOLD_MIN_REMAINING:.0f}s)\n"
-        f"RSI({RSI_PERIOD})      : [bold green]ON[/] (1s candles)\n"
-        f"Direction   : [bold green]3-signal vote[/]\n"
+        f"RSI({RSI_PERIOD})      : [bold green]VETO[/] (<{RSI_OVERSOLD:.0f} UP / >{RSI_OVERBOUGHT:.0f} DOWN)\n"
+        f"Direction   : [bold green]3-signal vote + macro 5min trend[/]\n"
         f"TP / SL     : +{TP_DELTA:.0%} / -{SL_DELTA:.0%} Trail:{TRAILING_DISTANCE}\n"
+        f"Entry window: [bold]{SETTINGS.entry_win_min:.1f}–{SETTINGS.entry_win_max:.1f} min[/]\n"
         f"Circuit br. : stop if loss > [bold red]{SETTINGS.max_daily_loss}$[/]\n\n"
         f"[bold]Controls:[/] [+]/[-] score  [r] reset  [a] AUTO  [q] quit\n",
         border_style="#f7931a",
@@ -592,6 +594,36 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                 ob, direction, m15, m30, m60,
                                 remaining_min=remaining, window_delta=wd,
                             )
+
+                            # ── RSI binary veto ──────────────────────────────
+                            rsi_now = FEED.rsi()
+                            rsi_veto = (
+                                (direction == "UP" and rsi_now < RSI_OVERSOLD) or
+                                (direction == "DOWN" and rsi_now > RSI_OVERBOUGHT)
+                            )
+                            if rsi_veto:
+                                scan_state["log"].appendleft({
+                                    "type": "skip", "dir": direction,
+                                    "reason": f"RSI veto {rsi_now:.0f}",
+                                    "mom15": m15, "mom60": m60,
+                                })
+                                continue
+
+                            # ── Macro trend filter ────────────────────────────
+                            macro = FEED.macro_trend()
+                            wd_strong = abs(wd) >= 0.08
+                            macro_veto = (
+                                macro != "NEUTRAL"
+                                and macro != direction
+                                and not wd_strong
+                            )
+                            if macro_veto:
+                                scan_state["log"].appendleft({
+                                    "type": "skip", "dir": direction,
+                                    "reason": f"macro {macro} vs {direction}",
+                                    "mom15": m15, "mom60": m60,
+                                })
+                                continue
 
                             # Track best score
                             scan_state["avg_edge"] = 0.1 * score + 0.9 * scan_state["avg_edge"]

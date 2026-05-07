@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 from pulse.config import (
     MIN_POS, MAX_POS, SPIKE_THRESHOLD,
     MOM_15S_REF, MOM_30S_REF, MOM_60S_REF,
-    RSI_OVERBOUGHT, RSI_OVERSOLD, TRADES_CSV,
+    TRADES_CSV,
 )
 from pulse.feed import FEED
 
@@ -38,7 +38,7 @@ def coherence_bonus(m15: float, m30: float, m60: float, direction: str) -> float
     return min(0.12, 0.08 * strength)
 
 
-# ── Score v5.0 ───────────────────────────────────────────────────────────────
+# ── Score v5.1 ───────────────────────────────────────────────────────────────
 def compute_score(
     ob: Optional[dict],
     direction: str,
@@ -47,10 +47,14 @@ def compute_score(
     window_delta: float = 0.0,
 ) -> Tuple[float, float, float]:
     """
-    Entry score v5.0.
+    Entry score v5.1.
 
-    raw = (0.45*mom + 0.20*imb + 0.10*rsi + 0.15*wd + 0.05*vol
+    raw = (0.35*mom + 0.20*imb + 0.30*wd + 0.05*vol
            + spike_bonus + coherence) * time_factor
+
+    RSI is no longer scored here — it is a binary veto applied in main.py.
+    OB imbalance uses a step function gated at 58% / 65% (not a smooth ramp).
+    window_delta is the primary oracle-lag signal (raised from 15% to 30%).
     """
     def ds(mom: float, ref: float) -> float:
         if direction == "UP":
@@ -65,26 +69,26 @@ def compute_score(
 
     spike_bonus = 0.15 if abs(m15) >= SPIKE_THRESHOLD else 0.0
 
-    # OB imbalance — both UP and DOWN computed correctly
+    # OB imbalance — step function gated at 58% / 65%
     imb_score = 0.0
     if ob and ob["total_d"] > 0:
         imb = ob["bid_d"] / ob["total_d"]
         if direction == "UP":
-            imb_score = min((imb - 0.5) * 4, 1.0) if imb > 0.5 else 0.0
+            if imb >= 0.65:
+                imb_score = 1.0
+            elif imb >= 0.58:
+                imb_score = 0.5
         else:
-            imb_score = min((0.5 - imb) * 4, 1.0) if imb < 0.5 else 0.0
-
-    # RSI on candle closes
-    rsi = FEED.rsi()
-    if direction == "UP":
-        rsi_score = min((rsi - RSI_OVERBOUGHT) / (100.0 - RSI_OVERBOUGHT), 1.0) if rsi > RSI_OVERBOUGHT else 0.0
-    else:
-        rsi_score = min((RSI_OVERSOLD - rsi) / RSI_OVERSOLD, 1.0) if rsi < RSI_OVERSOLD else 0.0
+            inv = 1.0 - imb
+            if inv >= 0.65:
+                imb_score = 1.0
+            elif inv >= 0.58:
+                imb_score = 0.5
 
     # Volatility
     vol_score = min(FEED.volatility() / 150.0, 1.0)
 
-    # Window delta
+    # Window delta — primary oracle-lag signal
     wd_aligned = window_delta if direction == "UP" else -window_delta
     wd_score = max(min(wd_aligned / 0.10, 1.0), 0.0)
 
@@ -100,10 +104,9 @@ def compute_score(
         time_factor = 1.0
 
     base = (
-        0.45 * mom_score + 0.20 * imb_score + 0.10 * rsi_score
-        + 0.15 * wd_score + 0.05 * vol_score
-    )  # sums to [0, 1]
-    # Apply bonuses as multipliers to preserve score resolution above 0.88
+        0.35 * mom_score + 0.20 * imb_score
+        + 0.30 * wd_score + 0.05 * vol_score
+    )  # weights sum to 0.90; remaining 0.10 headroom absorbed by bonuses
     bonus_mult = 1.0 + spike_bonus + coh   # up to 1.27x
     raw = min(base * bonus_mult, 1.0) * time_factor
     return round(raw, 3), mom_score, imb_score
