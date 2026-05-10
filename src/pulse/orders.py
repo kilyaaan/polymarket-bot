@@ -58,6 +58,34 @@ def _validate_order(price: float, size_usdc: float):
         raise ValueError(f"Size out of bounds: {size_usdc}")
 
 
+# ── Tick size cache ──────────────────────────────────────────────────────────
+TICK_SIZE_CACHE: Dict[str, str] = {}
+
+
+def get_tick_size(token_id: str) -> str:
+    """Fetch and cache the minimum tick size for a token. Returns string e.g. '0.01'."""
+    if token_id in TICK_SIZE_CACHE:
+        return TICK_SIZE_CACHE[token_id]
+    try:
+        validate_token_id(token_id)
+        r = _get_http().get(
+            f"{HOST}/tick-size",
+            params={"token_id": token_id},
+            timeout=2,
+        )
+        if r.status_code == 200:
+            ts = str(r.json().get("minimum_tick_size", "0.01"))
+            TICK_SIZE_CACHE[token_id] = ts
+            log.debug("Tick size for %s: %s", token_id[:16], ts)
+            return ts
+    except ValueError:
+        log.error("Invalid token_id for tick size: %s", token_id[:20])
+    except Exception as e:
+        log.warning("Tick size fetch error: %s", e)
+    TICK_SIZE_CACHE[token_id] = "0.01"
+    return "0.01"
+
+
 # ── Fee rate cache ───────────────────────────────────────────────────────────
 FEE_RATE_CACHE: Dict[str, float] = {}
 
@@ -176,9 +204,9 @@ def get_clob_client():
         if _CLOB_CLIENT is not None:  # double-checked under lock
             return _CLOB_CLIENT
         try:
-            from py_clob_client.client import ClobClient
-            from py_clob_client.clob_types import ApiCreds
-            from py_clob_client.constants import POLYGON
+            from py_clob_client_v2.client import ClobClient
+            from py_clob_client_v2.clob_types import ApiCreds
+            from py_clob_client_v2.constants import POLYGON
 
             pk = os.getenv("PRIVATE_KEY", "").strip()
             if not pk:
@@ -205,7 +233,7 @@ def get_clob_client():
                 log.info("CLOB creds loaded from env")
             else:
                 log.info("CLOB deriving creds automatically")
-                creds = _CLOB_CLIENT.create_or_derive_api_creds()
+                creds = _CLOB_CLIENT.create_or_derive_api_key()
                 _CLOB_CLIENT.set_api_creds(creds)
                 log.info("CLOB creds derived")
             return _CLOB_CLIENT
@@ -240,7 +268,8 @@ def cancel_order_safe(order_id: str) -> bool:
     if cl is None:
         return False
     try:
-        cl.cancel(order_id)
+        from py_clob_client_v2.clob_types import OrderPayload
+        cl.cancel_order(OrderPayload(orderID=order_id))
         _untrack_order(order_id)
         log.info("Cancelled order %s", order_id[:16])
         return True
@@ -258,7 +287,8 @@ def cancel_all_pending():
         orders = list(_pending_orders)
     for oid in orders:
         try:
-            cl.cancel(oid)
+            from py_clob_client_v2.clob_types import OrderPayload
+            cl.cancel_order(OrderPayload(orderID=oid))
             log.info("Cancelled pending order %s", oid[:16])
         except Exception as e:
             log.warning("Cancel order %s failed: %s", oid[:16], e)
@@ -286,18 +316,23 @@ def place_order(token_id: str, price: float, size_usdc: float,
 
     def _do():
         try:
-            from py_clob_client.clob_types import OrderArgs
-            from py_clob_client.order_builder.constants import BUY
+            from py_clob_client_v2.clob_types import OrderArgsV2, PartialCreateOrderOptions
+            from py_clob_client_v2.order_builder.constants import BUY
             cl = get_clob_client()
             if cl is None:
                 return None
             shares = math.ceil(size_usdc / max(price, 0.001) * 10000) / 10000
             resp = cl.create_and_post_order(
-                OrderArgs(token_id=token_id, price=price, size=shares, side=BUY))
-            oid = resp.get("orderID") if resp else None
-            if oid:
-                _track_order(oid)
-                log.info("Order placed: %s price=%.3f size=%.2f$", oid[:16], price, size_usdc)
+                OrderArgsV2(token_id=token_id, price=price, size=shares, side=BUY),
+                options=PartialCreateOrderOptions(tick_size=get_tick_size(token_id)))
+            if not resp or not isinstance(resp, dict):
+                return None
+            oid = resp.get("orderID")
+            if not oid:
+                log.error("BUY rejected — no orderID: %s", resp)
+                return None
+            _track_order(oid)
+            log.info("Order placed: %s price=%.3f size=%.2f$", oid[:16], price, size_usdc)
             return oid
         except Exception as e:
             log.error("Place order error: %s", e)
@@ -341,19 +376,24 @@ def place_limit_sell(token_id: str, price: float, shares: float,
     if dry:
         return f"dry_sl_{int(time.time() * 1000)}"
     try:
-        from py_clob_client.clob_types import OrderArgs
-        from py_clob_client.order_builder.constants import SELL
+        from py_clob_client_v2.clob_types import OrderArgsV2, PartialCreateOrderOptions
+        from py_clob_client_v2.order_builder.constants import SELL
         cl = get_clob_client()
         if cl is None:
             return None
         resp = cl.create_and_post_order(
-            OrderArgs(token_id=token_id, price=price,
-                      size=round(shares, 4), side=SELL))
-        oid = resp.get("orderID") if resp else None
-        if oid:
-            _track_order(oid)
-            log.info("SL order pre-placed: %s price=%.3f shares=%.4f",
-                     oid[:16], price, shares)
+            OrderArgsV2(token_id=token_id, price=price,
+                        size=round(shares, 4), side=SELL),
+            options=PartialCreateOrderOptions(tick_size=get_tick_size(token_id)))
+        if not resp or not isinstance(resp, dict):
+            return None
+        oid = resp.get("orderID")
+        if not oid:
+            log.error("SL order rejected — no orderID: %s", resp)
+            return None
+        _track_order(oid)
+        log.info("SL order pre-placed: %s price=%.3f shares=%.4f",
+                 oid[:16], price, shares)
         return oid
     except Exception as e:
         log.error("Place SL order error: %s", e)
@@ -374,18 +414,23 @@ def close_position(token_id: str, price: float, shares_held: float,
 
     def _do():
         try:
-            from py_clob_client.clob_types import OrderArgs
-            from py_clob_client.order_builder.constants import SELL
+            from py_clob_client_v2.clob_types import OrderArgsV2, PartialCreateOrderOptions
+            from py_clob_client_v2.order_builder.constants import SELL
             cl = get_clob_client()
             if cl is None:
                 return None
             resp = cl.create_and_post_order(
-                OrderArgs(token_id=token_id, price=price,
-                          size=round(shares_held, 4), side=SELL))
-            oid = resp.get("orderID") if resp else None
-            if oid:
-                _track_order(oid)
-                log.info("Close order placed: %s price=%.3f shares=%.4f", oid[:16], price, shares_held)
+                OrderArgsV2(token_id=token_id, price=price,
+                            size=round(shares_held, 4), side=SELL),
+                options=PartialCreateOrderOptions(tick_size=get_tick_size(token_id)))
+            if not resp or not isinstance(resp, dict):
+                return None
+            oid = resp.get("orderID")
+            if not oid:
+                log.error("Close order rejected — no orderID: %s", resp)
+                return None
+            _track_order(oid)
+            log.info("Close order placed: %s price=%.3f shares=%.4f", oid[:16], price, shares_held)
             return oid
         except Exception as e:
             log.error("Close position error: %s", e)

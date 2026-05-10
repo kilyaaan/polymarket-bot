@@ -15,7 +15,7 @@ load_dotenv()
 # ── Wallet / API ─────────────────────────────────────────────────────────────
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "").strip()
 POLYGON_RPC = os.getenv("POLYGON_RPC", "https://polygon-bor-rpc.publicnode.com")
-USDC_POLYGON = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
+USDC_POLYGON = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"  # pUSD (Polymarket USD, migré le 28/04/2026)
 
 HOST = "https://clob.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
@@ -35,19 +35,21 @@ SCAN_INTERVAL = 1
 SYNC_WALLET_EVERY = 5
 
 ENTRY_WINDOW_MIN = 0.3
-ENTRY_WINDOW_MAX = 3.0
+ENTRY_WINDOW_MAX = 4.0
 
-TP_DELTA = 0.18
-SL_DELTA = 0.12
-HOLD_THRESHOLD = 0.58
-HOLD_MIN_REMAINING = 90.0
+# v6 -- hold-to-expiry pur, entree sur tokens bas uniquement
+# Backtest 30j BTC 1s : entree 0.37-0.50 = +2165$ vs 0.50-0.64 = -855$
+TP_DELTA = 0.50          # jamais atteint -- pas de TP
+SL_DELTA = 0.35          # SL de securite uniquement sur crash extreme (>35%)
+HOLD_THRESHOLD = 0.01    # active hold-to-expiry immediatement
+HOLD_MIN_REMAINING = 0.0 # pas de contrainte de temps pour activer hold
 HOLD_ENABLED = True
 
 MIN_ENTRY_PRICE = 0.37
-MAX_ENTRY_PRICE = 0.63
+MAX_ENTRY_PRICE = 0.50   # uniquement tokens bas (edge positif backtest)
 MAX_SPREAD = 0.03
-TRAILING_STOP = True
-TRAILING_DISTANCE = 0.06
+TRAILING_STOP = False    # pas de trailing -- on tient jusqu'a expiry
+TRAILING_DISTANCE = 0.99
 
 MAX_DAILY_LOSS = 50.0
 DEFAULT_TAKER_FEE_RATE = 0.02
@@ -58,7 +60,8 @@ SPIKE_DISPLAY_THRESHOLD = 0.02
 MOM_15S_REF = 0.05
 MOM_30S_REF = 0.10
 MOM_60S_REF = 0.20
-MIN_SCORE = 0.60
+MIN_SCORE = 0.64
+BTC_TREND_THRESHOLD = 0.10  # % BTC momentum 60s max contre la direction d'entree
 MIN_MOM_GLOBAL = 0.001
 RSI_PERIOD = 7
 RSI_OVERBOUGHT = 65.0
@@ -76,7 +79,7 @@ BTC_CFG = {
 def _session_csv() -> Path:
     from datetime import datetime
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return Path(f"crypto_trades_btc_v5_{ts}.csv")
+    return Path(f"crypto_trades_btc_v6_{ts}.csv")
 
 TRADES_CSV = _session_csv()
 POSITIONS_CHECKPOINT = Path("positions.json")
@@ -208,6 +211,8 @@ class Position:
     peak_price: float = 0.0
     trail_sl: float = 0.0
     mom15_at_entry: float = 0.0
+    mom30_at_entry: float = 0.0
+    mom60_at_entry: float = 0.0
     rsi_at_entry: float = 50.0
     kelly_used: float = 0.0
     fee_rate_used: float = DEFAULT_TAKER_FEE_RATE
@@ -215,7 +220,16 @@ class Position:
     close_fill: str = ""
     sl_order_id: str = ""
     holding_expiry: bool = False
+    awaiting_resolution: bool = False
     verified: bool = True
+    # Extended analytics fields
+    spread_at_entry: float = 0.0
+    ob_depth_at_entry: float = 0.0
+    spike_size_at_entry: float = 0.0
+    trough_price: float = 0.0
+    session_pnl_before: float = 0.0
+    market_remaining_min_at_entry: float = 0.0
+    window_delta_at_entry: float = 0.0
 
     @property
     def pnl_gross(self) -> float:

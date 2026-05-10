@@ -63,7 +63,7 @@ def make_dashboard(
     # Header
     layout["header"].update(Panel(
         Text.assemble(
-            (" CRYPTO PULSE v5.0-BTC ", "bold #f7931a"),
+            (" CRYPTO PULSE v6.0-BTC ", "bold #f7931a"),
             (" | scan #", "dim"), (str(stats.scans), "white"),
             (" | ", "dim"), (stats.elapsed, "yellow"),
             (" | next: ", "dim"), (f"{int(countdown)}s", "bold cyan"),
@@ -198,7 +198,7 @@ def make_dashboard(
     st = Table(box=None, show_header=False, padding=(0, 1), expand=True)
     st.add_column(style="dim")
     st.add_column(justify="right")
-    st.add_row("Bankroll", f"[bold green]{bankroll:.2f} USDC.e[/]")
+    st.add_row("Bankroll", f"[bold green]{bankroll:.2f} pUSD[/]")
     st.add_row("P&L", f"[bold {pc2}]{stats.total_pnl:+.2f} USDC[/]")
     st.add_row("Win rate", f"[cyan]{stats.win_rate:.1f}%[/] ({stats.wins}W/{stats.losses}L)")
     st.add_row("Positions", f"[yellow]{len(positions)}[/]/{MAX_OPEN_POS}")
@@ -270,7 +270,7 @@ def make_dashboard(
             f" | Entry:{MIN_ENTRY_PRICE:.2f}-{MAX_ENTRY_PRICE:.2f}"
             f" | Spike:>{SPIKE_THRESHOLD:.2%}"
             f" | Window:{ENTRY_WINDOW_MIN}-{ENTRY_WINDOW_MAX}min"
-            f" | Scan:{si}s CB:-{max_dl:.0f}$ | v5.0-BTC",
+            f" | Scan:{si}s CB:-{max_dl:.0f}$ | v6.0-BTC",
         ),
         style="on #080a0c", border_style="#1a2030",
     ))

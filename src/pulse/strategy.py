@@ -12,6 +12,7 @@ from pulse.config import (
     MOM_15S_REF, MOM_30S_REF, MOM_60S_REF,
     RSI_OVERBOUGHT, RSI_OVERSOLD, TRADES_CSV,
 )
+from pathlib import Path as _Path
 from pulse.feed import FEED
 
 log = logging.getLogger(__name__)
@@ -157,13 +158,26 @@ def _load_win_rates(csv_path: Path) -> Dict[str, float]:
     return result
 
 
+def _find_best_trades_csv() -> _Path:
+    """Find the most recent non-empty trades CSV for Kelly calibration."""
+    try:
+        parent = _Path(str(TRADES_CSV)).parent
+        candidates = sorted(parent.glob("crypto_trades_btc_v6_*.csv"), reverse=True)
+        for p in candidates:
+            if p.stat().st_size > 200:
+                return p
+    except Exception:
+        pass
+    return _Path(str(TRADES_CSV))
+
+
 def _get_win_prob(score: float) -> float:
     """Get calibrated win probability for a score, with caching."""
     global _win_prob_cache, _win_prob_cache_age
     import time
     now = time.time()
     if now - _win_prob_cache_age > _CACHE_TTL:
-        _win_prob_cache = _load_win_rates(TRADES_CSV)
+        _win_prob_cache = _load_win_rates(_find_best_trades_csv())
         _win_prob_cache_age = now
 
     if score < 0.60:

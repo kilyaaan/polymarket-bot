@@ -19,7 +19,7 @@ from pulse.config import (
     SETTINGS, SHUTDOWN_EVENT, BANKROLL,
     MAX_OPEN_POS, MAX_DIR_POS, MIN_SCORE, SCAN_INTERVAL, MAX_DAILY_LOSS,
     SPIKE_THRESHOLD, MIN_ENTRY_PRICE, MAX_ENTRY_PRICE, MAX_SPREAD,
-    MIN_MOM_GLOBAL, TP_DELTA, SL_DELTA, TRAILING_STOP, TRAILING_DISTANCE,
+    MIN_MOM_GLOBAL, TP_DELTA, SL_DELTA, TRAILING_STOP, TRAILING_DISTANCE, BTC_TREND_THRESHOLD,
     HOLD_THRESHOLD, HOLD_MIN_REMAINING, HOLD_ENABLED, RSI_PERIOD,
     TRADES_CSV, POSITIONS_CHECKPOINT,
     Position, SessionStats,
@@ -29,7 +29,7 @@ from pulse.strategy import compute_score, kelly_size, vote_direction, has_overla
 from pulse.orders import (
     place_order, poll_order_status, close_position, place_limit_sell,
     cancel_all_pending, cancel_order_safe,
-    get_ob, get_ob_multi, get_cached_markets, get_fee_rate,
+    get_ob, get_ob_multi, get_cached_markets, get_fee_rate, get_tick_size,
     sync_wallet_usdc, redeem_loop, prefetch_loop, shutdown_ob_pool,
 )
 from pulse.risk import ExpiringBlacklist, save_checkpoint, load_checkpoint, reconcile_positions
@@ -127,7 +127,7 @@ def run(dry: bool = True, hold_enabled: bool = True):
         time.sleep(2)
 
     console.print(Panel(
-        f"[bold #f7931a]CRYPTO PULSE SNIPER v5.0-BTC[/]\n"
+        f"[bold #f7931a]CRYPTO PULSE SNIPER v6.0-BTC[/]\n"
         f"Mode        : {'[bold red]LIVE[/]' if not dry else '[bold cyan]SIMULATION[/]'}\n"
         f"Score min   : [bold]{SETTINGS.min_score:.2f}[/]\n"
         f"Kelly 1/4   : [bold green]ON[/] (calibrated from CSV)\n"
@@ -162,11 +162,20 @@ def run(dry: bool = True, hold_enabled: bool = True):
 
     # Load positions from checkpoint (crash recovery)
     positions: List[Position] = load_checkpoint()
+    _missed_pnl = 0.0
     if positions:
-        positions = reconcile_positions(positions)
+        positions, _missed_pnl = reconcile_positions(positions)
         save_checkpoint(positions)
+        # Re-subscribe recovered positions to Token WS for fast SL/TP detection
+        for _rp in positions:
+            _sl = _rp.trail_sl if _rp.trail_sl > 0 else round(_rp.entry_price - SL_DELTA, 4)
+            token_ws.subscribe(_rp.token_id, _sl, round(_rp.entry_price + TP_DELTA, 4))
+            log.info("WS re-subscribed recovered pos: %s %s", _rp.direction, _rp.token_id[:16])
 
     stats = SessionStats()
+    if _missed_pnl:
+        stats.total_pnl += _missed_pnl
+        stats.btc_pnl += _missed_pnl
     threading.Thread(target=lambda: _recap_loop(stats), name="recap", daemon=True).start()
     blacklist = ExpiringBlacklist(ttl=360.0)
     bankroll = sync_wallet_usdc(force=True)
@@ -174,11 +183,11 @@ def run(dry: bool = True, hold_enabled: bool = True):
         bankroll = BANKROLL
         log.warning("Wallet not found — fallback %.0f$", BANKROLL)
     else:
-        log.info("USDC.e on-chain: %.2f$", bankroll)
+        log.info("pUSD on-chain: %.2f$", bankroll)
 
     countdown = float(SETTINGS.scan_interval)
     last_spike_ts = 0.0
-    notify("STARTUP", f"v5.0-BTC {'LIVE' if not dry else 'SIM'} démarré",
+    notify("STARTUP", f"v6.0-BTC {'LIVE' if not dry else 'SIM'} démarré",
            **{"Mode": "LIVE" if not dry else "SIM",
               "Score min": f"{SETTINGS.min_score:.2f}",
               "Circuit br.": f"-{SETTINGS.max_daily_loss}$"})
@@ -252,7 +261,8 @@ def run(dry: bool = True, hold_enabled: bool = True):
                         pos_hit.close_fill = "filled"
                     pos_hit.current_price = exit_price
                     pnl = log_trade(pos_hit, exit_price, reason_ws, stats,
-                                    FEED.current, SETTINGS.min_score)
+                                    FEED.current, SETTINGS.min_score,
+                                    mom15_exit=m15, rsi_exit=FEED.rsi())
                     stats.total_pnl += pnl
                     stats.total += 1
                     if pnl >= 0:
@@ -285,7 +295,55 @@ def run(dry: bool = True, hold_enabled: bool = True):
                     for pos in positions:
                         ob = exit_obs.get(pos.token_id)
                         if ob:
-                            pos.current_price = ob["mid"]
+                            pos.current_price = ob["bb"] or ob["mid"]
+
+                        # ── Awaiting expiry resolution (non-blocking) ─────────
+                        if pos.awaiting_resolution:
+                            _p = pos.current_price
+                            if _p >= 0.90:
+                                pos.current_price = 1.0
+                                pos.awaiting_resolution = False
+                            elif _p <= 0.10:
+                                pos.current_price = 0.0
+                                pos.awaiting_resolution = False
+                            else:
+                                continue  # still uncertain, check next scan
+                            # Resolved — cancel any stale SL, log and close
+                            if pos.sl_order_id:
+                                if not dry:
+                                    cancel_order_safe(pos.sl_order_id)
+                                pos.sl_order_id = ""
+                            if not dry:
+                                bankroll = sync_wallet_usdc(force=True)
+                                tg(f"EXPIRY {pos.direction} — resolved")
+                            pnl = log_trade(pos, pos.current_price, "EXPIRY", stats,
+                                            FEED.current, SETTINGS.min_score,
+                                            mom15_exit=m15, rsi_exit=FEED.rsi())
+                            stats.total_pnl += pnl
+                            stats.total += 1
+                            if pnl >= 0:
+                                stats.wins += 1
+                            else:
+                                stats.losses += 1
+                            scan_state["log"].appendleft({
+                                "type": "exit", "dir": pos.direction,
+                                "reason": "EXPIRY", "pnl": round(pnl, 2),
+                                "pnl_pct": round(pos.pnl_pct * 100, 1),
+                                "size": round(pos.size_usdc, 2),
+                                "entry": round(pos.entry_price, 4),
+                                "mom15": m15, "mom60": m60,
+                            })
+                            _level = "WIN" if pnl >= 0 else "LOSS"
+                            notify(_level, f"{_level} — BTC {pos.direction}",
+                                   **{"P&L net": f"{pnl:+.2f}$",
+                                      "Raison": "EXPIRY",
+                                      "Durée": f"{pos.elapsed_min:.1f} min",
+                                      "Score entrée": f"{pos.score:.3f}",
+                                      "Fill": "expiry",
+                                      "Session P&L": f"{stats.total_pnl:+.2f}$"})
+                            token_ws.unsubscribe(pos.token_id)
+                            closed.append(pos)
+                            continue
 
                         rem_sec = pos.market.remaining_sec
 
@@ -295,7 +353,8 @@ def run(dry: bool = True, hold_enabled: bool = True):
                         if pos.sl_order_id and not pos.holding_expiry:
                             sl_status, _ = poll_order_status(pos.sl_order_id, timeout=1.0)
                             if sl_status in ("filled", "partial"):
-                                exit_price = ob["bb"] if ob else round(pos.entry_price - SL_DELTA, 4)
+                                # Use the actual SL execution price, not current OB bid
+                                exit_price = pos.trail_sl if pos.trail_sl > 0 else round(pos.entry_price - SL_DELTA, 4)
                                 reason_sl = f"SL {exit_price:.3f}(<{round(pos.entry_price - SL_DELTA, 4):.3f})"
                                 pos.close_order_id = pos.sl_order_id
                                 pos.close_fill = sl_status
@@ -305,7 +364,8 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                 if not dry:
                                     bankroll = sync_wallet_usdc(force=True)
                                 pnl = log_trade(pos, exit_price, reason_sl, stats,
-                                                FEED.current, SETTINGS.min_score)
+                                                FEED.current, SETTINGS.min_score,
+                                                mom15_exit=m15, rsi_exit=FEED.rsi())
                                 stats.total_pnl += pnl
                                 stats.total += 1
                                 if pnl >= 0:
@@ -355,10 +415,16 @@ def run(dry: bool = True, hold_enabled: bool = True):
                             log.info("HOLD activated: %s @%.3f %.0fs remaining",
                                      pos.direction, pos.current_price, rem_sec)
 
+                        # Always track peak and trough for analytics
+                        _price_moved_up = pos.current_price > pos.peak_price
+                        if _price_moved_up:
+                            pos.peak_price = pos.current_price
+                        if pos.trough_price == 0.0 or pos.current_price < pos.trough_price:
+                            pos.trough_price = pos.current_price
+
                         # Trailing stop (only for hold protection — not for normal exits
                         # which are handled by the pre-placed SL order)
-                        if TRAILING_STOP and pos.current_price > pos.peak_price:
-                            pos.peak_price = pos.current_price
+                        if TRAILING_STOP and _price_moved_up:
                             pos.trail_sl = max(
                                 pos.trail_sl,
                                 round(pos.peak_price - TRAILING_DISTANCE, 4),
@@ -427,9 +493,13 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                                     pos.direction, pos.token_id[:16])
                                         continue
 
-                                    exit_price = ob2["bb"]
-                                    close_id, fill_status = close_position(
-                                        pos.token_id, exit_price, pos.shares_held, dry)
+                                    exit_price = max(ob2["bb"], 0.01)
+                                    try:
+                                        close_id, fill_status = close_position(
+                                            pos.token_id, exit_price, pos.shares_held, dry)
+                                    except ValueError as _ve:
+                                        log.error("Close skipped — invalid price: %s", _ve)
+                                        continue
                                     pos.close_order_id = close_id if close_id else "failed"
                                     pos.close_fill = fill_status
                                     if not dry:
@@ -457,13 +527,25 @@ def run(dry: bool = True, hold_enabled: bool = True):
                             else:
                                 pos.close_order_id = "expiry_resolution"
                                 pos.close_fill = "expiry"
+                                # Snap to clean resolution price (0.0 or 1.0)
+                                if pos.current_price >= 0.90:
+                                    pos.current_price = 1.0
+                                elif pos.current_price <= 0.10:
+                                    pos.current_price = 0.0
+                                else:
+                                    # Uncertain — defer to next scan (non-blocking)
+                                    log.info("EXPIRY uncertain price=%.3f — awaiting resolution",
+                                             pos.current_price)
+                                    pos.awaiting_resolution = True
+                                    continue  # skip logging, keep position alive
                                 if not dry:
                                     time.sleep(5)
                                     bankroll = sync_wallet_usdc(force=True)
                                     tg(f"EXPIRY {pos.direction} — auto resolution")
 
                             pnl = log_trade(pos, pos.current_price, reason, stats,
-                                           FEED.current, SETTINGS.min_score)
+                                           FEED.current, SETTINGS.min_score,
+                                           mom15_exit=m15, rsi_exit=FEED.rsi())
                             stats.total_pnl += pnl
                             stats.total += 1
                             if pnl >= 0:
@@ -607,6 +689,22 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                 })
                                 continue
 
+                            # BTC trend filter — block entries against sustained trend
+                            if direction == "DOWN" and m60 > BTC_TREND_THRESHOLD:
+                                scan_state["log"].appendleft({
+                                    "type": "skip", "dir": direction,
+                                    "reason": f"btc_trend UP m60={m60:.3f}>{BTC_TREND_THRESHOLD}",
+                                    "mom15": m15, "mom60": m60,
+                                })
+                                continue
+                            if direction == "UP" and m60 < -BTC_TREND_THRESHOLD:
+                                scan_state["log"].appendleft({
+                                    "type": "skip", "dir": direction,
+                                    "reason": f"btc_trend DOWN m60={m60:.3f}<-{BTC_TREND_THRESHOLD}",
+                                    "mom15": m15, "mom60": m60,
+                                })
+                                continue
+
                             entry_p = min(round(ob["ba"] + 0.01, 2), 0.99)
                             if not (MIN_ENTRY_PRICE <= entry_p <= MAX_ENTRY_PRICE):
                                 scan_state["log"].appendleft({
@@ -682,12 +780,21 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                 order_id=order_id,
                                 entry_crypto=FEED.current, score=score,
                                 peak_price=entry_p,
+                                trough_price=entry_p,
                                 trail_sl=sl_price,
                                 sl_order_id=sl_oid or "",
                                 mom15_at_entry=m15,
+                                mom30_at_entry=m30,
+                                mom60_at_entry=m60,
                                 rsi_at_entry=FEED.rsi(),
                                 kelly_used=size,
                                 fee_rate_used=get_fee_rate(tok),
+                                spread_at_entry=round(ob["spread"], 4),
+                                ob_depth_at_entry=round(ob["total_d"], 2),
+                                spike_size_at_entry=round(abs(m15), 6),
+                                session_pnl_before=round(stats.total_pnl, 4),
+                                market_remaining_min_at_entry=round(remaining, 2),
+                                window_delta_at_entry=round(wd, 4),
                             )
                             positions.append(pos)
                             _available -= size  # deduct immediately for next candidate
@@ -754,7 +861,8 @@ def run(dry: bool = True, hold_enabled: bool = True):
                 cancel_order_safe(pos.sl_order_id)
                 pos.sl_order_id = ""
             pnl = log_trade(pos, pos.current_price, "SHUTDOWN_OPEN", stats,
-                            FEED.current, SETTINGS.min_score)
+                            FEED.current, SETTINGS.min_score,
+                            mom15_exit=FEED.momentum_all()[0], rsi_exit=FEED.rsi())
             stats.total_pnl += pnl
             stats.total += 1
             if pnl >= 0:
@@ -859,7 +967,7 @@ def validate():
         if cl:
             def _test_auth():
                 # get_orders requires Level 2 auth — same creds used by place/close
-                result = cl.get_orders()
+                result = cl.get_open_orders()
                 return f"get_orders() OK — {len(result) if isinstance(result, list) else '?'} ordre(s) en cours"
             _check("GET /orders (Level 2 auth)", _test_auth)
         else:
@@ -869,15 +977,16 @@ def validate():
         console.print("\n[bold]7. Construction d'ordre (signé, NON envoyé)[/]")
         if cl and ob:
             def _build_order():
-                from py_clob_client.clob_types import OrderArgs
-                from py_clob_client.order_builder.constants import BUY, SELL
-                buy_price = min(round(ob["ba"] + 0.01, 2), 0.98)
-                buy_args = OrderArgs(token_id=tok, price=buy_price, size=1.0, side=BUY)
-                cl.create_order(buy_args)
-                sell_price = max(round(ob["bb"] - 0.01, 2), 0.02)
-                sell_args = OrderArgs(token_id=tok, price=sell_price, size=1.0, side=SELL)
-                cl.create_order(sell_args)
-                return f"BUY@{buy_price} ✓  SELL@{sell_price} ✓  (non postés)"
+                from py_clob_client_v2.clob_types import OrderArgsV2, PartialCreateOrderOptions
+                from py_clob_client_v2.order_builder.constants import BUY, SELL
+                ts = get_tick_size(tok)
+                buy_price = min(round(ob["ba"] + float(ts), 2), 0.98)
+                buy_args = OrderArgsV2(token_id=tok, price=buy_price, size=1.0, side=BUY)
+                cl.create_order(buy_args, options=PartialCreateOrderOptions(tick_size=ts))
+                sell_price = max(round(ob["bb"] - float(ts), 2), float(ts))
+                sell_args = OrderArgsV2(token_id=tok, price=sell_price, size=1.0, side=SELL)
+                cl.create_order(sell_args, options=PartialCreateOrderOptions(tick_size=ts))
+                return f"BUY@{buy_price} ok  SELL@{sell_price} ok  ts={ts} (non postes)"
             _check("create_order BUY + SELL", _build_order)
         else:
             console.print("  [yellow]⚠[/] Skipped (pas de client ou OB)")
@@ -908,7 +1017,7 @@ def cli():
     signal.signal(signal.SIGINT, _shutdown_handler)
     signal.signal(signal.SIGTERM, _shutdown_handler)
 
-    p = argparse.ArgumentParser(description="Crypto Pulse Sniper v5.0-BTC")
+    p = argparse.ArgumentParser(description="Crypto Pulse Sniper v6.0-BTC")
     p.add_argument("--validate", action="store_true", help="Test CLOB connectivity sans placer d'ordre")
     p.add_argument("--live", action="store_true", help="Live mode (default: simulation)")
     p.add_argument("--score", type=float, default=MIN_SCORE, help=f"Min score (default: {MIN_SCORE})")

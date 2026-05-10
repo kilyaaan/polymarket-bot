@@ -60,6 +60,17 @@ def _position_to_dict(pos: Position) -> dict:
         "kelly_used": pos.kelly_used,
         "fee_rate_used": pos.fee_rate_used,
         "holding_expiry": pos.holding_expiry,
+        "awaiting_resolution": pos.awaiting_resolution,
+        "spread_at_entry": pos.spread_at_entry,
+        "ob_depth_at_entry": pos.ob_depth_at_entry,
+        "spike_size_at_entry": pos.spike_size_at_entry,
+        "trough_price": pos.trough_price,
+        "session_pnl_before": pos.session_pnl_before,
+        "market_remaining_min_at_entry": pos.market_remaining_min_at_entry,
+        "window_delta_at_entry": pos.window_delta_at_entry,
+        "mom30_at_entry": pos.mom30_at_entry,
+        "mom60_at_entry": pos.mom60_at_entry,
+        "sl_order_id": pos.sl_order_id,
         # Market fields
         "market_condition_id": pos.market.condition_id,
         "market_question": pos.market.question,
@@ -103,7 +114,18 @@ def _dict_to_position(d: dict) -> Position:
         kelly_used=d.get("kelly_used", 0.0),
         fee_rate_used=d.get("fee_rate_used", DEFAULT_TAKER_FEE_RATE),
         holding_expiry=d.get("holding_expiry", False),
+        awaiting_resolution=d.get("awaiting_resolution", False),
         verified=False,  # needs reconciliation
+        spread_at_entry=d.get("spread_at_entry", 0.0),
+        ob_depth_at_entry=d.get("ob_depth_at_entry", 0.0),
+        spike_size_at_entry=d.get("spike_size_at_entry", 0.0),
+        trough_price=d.get("trough_price", 0.0),
+        session_pnl_before=d.get("session_pnl_before", 0.0),
+        market_remaining_min_at_entry=d.get("market_remaining_min_at_entry", 0.0),
+        window_delta_at_entry=d.get("window_delta_at_entry", 0.0),
+        mom30_at_entry=d.get("mom30_at_entry", 0.0),
+        mom60_at_entry=d.get("mom60_at_entry", 0.0),
+        sl_order_id=d.get("sl_order_id", ""),
     )
 
 
@@ -137,15 +159,18 @@ def load_checkpoint(path: Path | None = None) -> List[Position]:
         return []
 
 
-def reconcile_positions(positions: List[Position]) -> List[Position]:
+def reconcile_positions(positions: List[Position]) -> tuple:
     """
     Reconcile checkpoint positions against current market state.
 
     - Expired markets: log as MISSED_EXPIRY, remove
     - API unavailable: keep as unverified, will re-verify on next successful call
+
+    Returns (live_positions, missed_pnl) so the caller can add missed P&L to session stats.
     """
     now = time.time()
     live: List[Position] = []
+    missed_pnl = 0.0
     for pos in positions:
         if pos.market.end_time < now:
             log.warning(
@@ -156,11 +181,12 @@ def reconcile_positions(positions: List[Position]) -> List[Position]:
             )
             from pulse.logger import tg, log_trade
             from pulse.config import SessionStats, SETTINGS
-            stats = SessionStats()
+            _local_stats = SessionStats()
             pos.close_order_id = "missed_expiry"
             pos.close_fill = "missed_expiry"
-            log_trade(pos, pos.current_price or pos.entry_price,
-                      "MISSED_EXPIRY", stats, 0.0, SETTINGS.min_score)
+            pnl = log_trade(pos, pos.current_price or pos.entry_price,
+                            "MISSED_EXPIRY", _local_stats, 0.0, SETTINGS.min_score)
+            missed_pnl += pnl
             tg(f"MISSED_EXPIRY: {pos.direction} {pos.market.question}")
             continue
         pos.verified = False
@@ -174,4 +200,4 @@ def reconcile_positions(positions: List[Position]) -> List[Position]:
         from pulse.logger import tg
         tg(f"Crash recovery: {len(live)} position(s) recovered, {len(positions) - len(live)} expired")
 
-    return live
+    return live, missed_pnl

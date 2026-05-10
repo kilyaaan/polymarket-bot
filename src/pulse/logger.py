@@ -121,8 +121,12 @@ _notify_queue: queue.Queue = queue.Queue(maxsize=100)
 
 
 def _notify_worker():
-    while True:
-        item = _notify_queue.get()
+    from pulse.config import SHUTDOWN_EVENT
+    while not SHUTDOWN_EVENT.is_set() or not _notify_queue.empty():
+        try:
+            item = _notify_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
         level, title, fields = item
         for attempt in range(3):
             try:
@@ -187,6 +191,13 @@ _CSV_COLUMNS = [
     "fees", "duration_min", "btc_entry", "btc_exit",
     "score", "mom15_entry", "rsi_entry", "min_score",
     "reason", "held_expiry", "order_id", "close_order_id", "close_fill",
+    # Extended analytics
+    "token_peak", "token_trough",
+    "mom30_entry", "mom60_entry", "mom15_exit", "rsi_exit",
+    "window_delta", "btc_move_pct",
+    "spread_entry", "sl_price", "market_remaining_min",
+    "hour_of_day", "day_of_week",
+    "spike_size", "ob_depth_entry", "session_pnl_before",
 ]
 
 
@@ -210,6 +221,8 @@ def log_trade(
     stats: SessionStats,
     btc_current: float,
     min_score: float,
+    mom15_exit: float = 0.0,
+    rsi_exit: float = 50.0,
     path: Path | None = None,
 ) -> float:
     """Log a closed trade to CSV. Returns net PnL."""
@@ -224,10 +237,15 @@ def log_trade(
     pnl_net = pnl_gross - fees
     pct = pnl_net / max(pos.size_usdc, 0.001) * 100
 
+    btc_move_pct = round(
+        (btc_current - pos.entry_crypto) / max(pos.entry_crypto, 1.0) * 100, 4
+    )
+    _now = datetime.now()
+
     p = path or TRADES_CSV
     with open(p, "a", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow([
-            datetime.now().isoformat(),
+            _now.isoformat(),
             pos.direction,
             round(pos.entry_price, 4), round(exit_price, 4),
             round(pos.shares_held, 4),
@@ -242,6 +260,18 @@ def log_trade(
             round(min_score, 2),
             reason, pos.holding_expiry,
             pos.order_id, pos.close_order_id, pos.close_fill,
+            # Extended analytics
+            round(pos.peak_price, 4), round(pos.trough_price, 4),
+            round(pos.mom30_at_entry, 4), round(pos.mom60_at_entry, 4),
+            round(mom15_exit, 4), round(rsi_exit, 1),
+            round(pos.window_delta_at_entry, 4), btc_move_pct,
+            round(pos.spread_at_entry, 4),
+            round(pos.trail_sl, 4),
+            round(pos.market_remaining_min_at_entry, 2),
+            _now.hour, _now.weekday(),
+            round(pos.spike_size_at_entry, 6),
+            round(pos.ob_depth_at_entry, 2),
+            round(pos.session_pnl_before, 4),
         ])
 
     # Update stats
