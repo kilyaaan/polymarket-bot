@@ -39,8 +39,8 @@ ENTRY_WINDOW_MAX = 4.0
 
 # v6 -- hold-to-expiry pur, entree sur tokens bas uniquement
 # Backtest 30j BTC 1s : entree 0.37-0.50 = +2165$ vs 0.50-0.64 = -855$
-TP_DELTA = 0.50          # jamais atteint -- pas de TP
-SL_DELTA = 0.35          # SL de securite uniquement sur crash extreme (>35%)
+TP_DELTA = 0.27          # TP a ~entry+0.27 (~0.75 pour entry 0.48)
+SL_DELTA = 0.35          # SL de securite sur crash extreme (>35%)
 HOLD_THRESHOLD = 0.01    # active hold-to-expiry immediatement
 HOLD_MIN_REMAINING = 0.0 # pas de contrainte de temps pour activer hold
 HOLD_ENABLED = True
