@@ -759,15 +759,17 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                     log.warning("BUY cancelled: %s", direction)
                                     continue
                                 if buy_fill == "open":
-                                    # Order not confirmed — cancel and skip to avoid ghost position
+                                    # Order not confirmed — cancel and blacklist to avoid re-entry
+                                    # (cancel may fail if order was already matched on-chain)
                                     cancel_order_safe(order_id)
+                                    blacklist.add(mkt.condition_id)
                                     scan_state["log"].appendleft({
                                         "type": "skip", "dir": direction,
-                                        "reason": "BUY timeout — annulé",
+                                        "reason": "BUY timeout — annulé + blacklist",
                                         "mom15": m15, "mom60": m60,
                                     })
                                     notify("INFO", f"BUY timeout annulé {direction}")
-                                    log.warning("BUY timed out — cancelled and skipped: %s", direction)
+                                    log.warning("BUY timed out — cancelled and blacklisted: %s", direction)
                                     continue
                                 if filled_shares is not None:
                                     actual_shares = filled_shares
