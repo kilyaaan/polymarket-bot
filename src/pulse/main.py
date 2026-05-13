@@ -260,9 +260,10 @@ def run(dry: bool = True, hold_enabled: bool = True):
                         if close_id is None or fill_status not in ("filled", "partial"):
                             log.warning("WS close failed: %s %s — keeping position",
                                         ws_reason, pos_hit.direction)
-                            # Re-subscribe so we keep monitoring
+                            # Re-subscribe using current trail_sl (not original SL)
+                            current_sl = pos_hit.trail_sl if pos_hit.trail_sl > 0 else round(pos_hit.entry_price - SL_DELTA, 4)
                             token_ws.subscribe(ws_tid,
-                                               round(pos_hit.entry_price - SL_DELTA, 4),
+                                               current_sl,
                                                round(pos_hit.entry_price + TP_DELTA, 4))
                             continue
                         bankroll = sync_wallet_usdc(force=True)
@@ -783,16 +784,13 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                             log.warning("BUY timeout but order was filled — recovering position: %s", direction)
                                             # Fall through to position creation below
                                         else:
-                                            # Still unknown — blacklist to prevent re-entry
+                                            # Still unknown (network error) — create position
+                                            # with estimated shares to ensure TP/SL runs.
+                                            # Better to track a ghost than leave a real position unprotected.
                                             blacklist.add(mkt.condition_id)
-                                            scan_state["log"].appendleft({
-                                                "type": "skip", "dir": direction,
-                                                "reason": "BUY timeout — cancel failed + blacklist",
-                                                "mom15": m15, "mom60": m60,
-                                            })
-                                            notify("INFO", f"BUY timeout cancel failed {direction}")
-                                            log.warning("BUY timed out and cancel failed — blacklisted: %s", direction)
-                                            continue
+                                            log.warning("BUY timeout cancel failed + poll unknown — tracking with estimated shares: %s", direction)
+                                            notify("INFO", f"BUY timeout tracking estimated {direction}")
+                                            # Fall through to position creation with estimated shares
                                 if filled_shares is not None:
                                     actual_shares = filled_shares
                                     log.info("Fill verified: %.4f shares (local est: %.4f)",

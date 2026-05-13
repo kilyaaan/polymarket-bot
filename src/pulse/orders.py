@@ -307,25 +307,32 @@ def _retry_order(fn, retries: int = 3):
 
 def place_order(token_id: str, price: float, size_usdc: float,
                 dry: bool = True) -> Optional[str]:
-    """Place a BUY order. Returns order ID or None."""
+    """Place a BUY order. Returns order ID or None.
+
+    Only retries on network exceptions — never retries after a POST was sent,
+    to avoid placing multiple orders on the same token.
+    """
     validate_token_id(token_id)
     _validate_order(price, size_usdc)
 
     if dry:
         return f"dry_{int(time.time() * 1000)}"
 
-    def _do():
+    from py_clob_client_v2.clob_types import OrderArgsV2, PartialCreateOrderOptions
+    from py_clob_client_v2.order_builder.constants import BUY
+
+    for attempt in range(3):
+        cl = get_clob_client()
+        if cl is None:
+            return None
         try:
-            from py_clob_client_v2.clob_types import OrderArgsV2, PartialCreateOrderOptions
-            from py_clob_client_v2.order_builder.constants import BUY
-            cl = get_clob_client()
-            if cl is None:
-                return None
             shares = math.ceil(size_usdc / max(price, 0.001) * 10000) / 10000
             resp = cl.create_and_post_order(
                 OrderArgsV2(token_id=token_id, price=price, size=shares, side=BUY),
                 options=PartialCreateOrderOptions(tick_size=get_tick_size(token_id)))
+            # POST was sent — do NOT retry regardless of response shape
             if not resp or not isinstance(resp, dict):
+                log.error("BUY unexpected response (order may have been placed): %s", resp)
                 return None
             oid = resp.get("orderID")
             if not oid:
@@ -335,9 +342,11 @@ def place_order(token_id: str, price: float, size_usdc: float,
             log.info("Order placed: %s price=%.3f size=%.2f$", oid[:16], price, size_usdc)
             return oid
         except Exception as e:
-            log.error("Place order error: %s", e)
-            return None
-    return _retry_order(_do)
+            log.error("Place order error (attempt %d/3): %s", attempt + 1, e)
+            if attempt < 2:
+                time.sleep(0.5 * (2 ** attempt))
+            # Only retry on exception (POST may not have been sent)
+    return None
 
 
 def poll_order_status(order_id: str, timeout: float = 10.0) -> Tuple[str, Optional[float]]:
