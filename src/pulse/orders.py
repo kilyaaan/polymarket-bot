@@ -110,6 +110,10 @@ def get_fee_rate(token_id: str) -> float:
             rate = None
             if raw is not None:
                 rate = float(raw) / 50000.0
+                # Sanity check: plausible fee range is 0.1 % – 10 %
+                if not (0.001 <= rate <= 0.10):
+                    log.warning("Fee rate out of bounds %.4f (raw=%s) — using default", rate, raw)
+                    rate = None
             if rate is not None:
                 FEE_RATE_CACHE[token_id] = rate
                 return rate
@@ -217,28 +221,32 @@ def get_clob_client():
             funder = (os.getenv("FUNDER", "") or os.getenv("WALLET_ADDRESS", "")).strip()
 
             if sig_type == 1 and funder:
-                _CLOB_CLIENT = ClobClient(HOST, key=pk, chain_id=POLYGON,
-                                          signature_type=1, funder=funder)
+                cl = ClobClient(HOST, key=pk, chain_id=POLYGON,
+                                signature_type=1, funder=funder)
             else:
-                _CLOB_CLIENT = ClobClient(HOST, key=pk, chain_id=POLYGON,
-                                          signature_type=0)
+                cl = ClobClient(HOST, key=pk, chain_id=POLYGON,
+                                signature_type=0)
 
             api_key = os.getenv("CLOB_API_KEY", "").strip()
             api_sec = os.getenv("CLOB_SECRET", "").strip()
             api_pass = os.getenv("CLOB_PASSPHRASE", "").strip()
 
             if api_key and api_sec and api_pass:
-                _CLOB_CLIENT.set_api_creds(ApiCreds(
+                cl.set_api_creds(ApiCreds(
                     api_key=api_key, api_secret=api_sec, api_passphrase=api_pass))
                 log.info("CLOB creds loaded from env")
             else:
                 log.info("CLOB deriving creds automatically")
-                creds = _CLOB_CLIENT.create_or_derive_api_key()
-                _CLOB_CLIENT.set_api_creds(creds)
+                creds = cl.create_or_derive_api_key()
+                cl.set_api_creds(creds)
                 log.info("CLOB creds derived")
+            # Assign global only after creds are fully set — prevents a
+            # half-initialised client being returned on key-derivation failure.
+            _CLOB_CLIENT = cl
             return _CLOB_CLIENT
         except Exception as e:
             log.error("CLOB init error: %s", e)
+            _CLOB_CLIENT = None  # ensure no partial client leaks out
             return None
 
 
@@ -413,7 +421,10 @@ def close_position(token_id: str, price: float, shares_held: float,
                    dry: bool = True) -> Tuple[Optional[str], str, Optional[float]]:
     """Place a SELL order to close a position.
     Returns (order_id, fill_status, filled_shares).
-    Never retries after POST is sent — avoids duplicate SELL orders.
+
+    One-shot — never retries. Retrying after a POST would risk a duplicate
+    SELL (naked short) if the TCP packet was already sent when the exception
+    fired. The stale-order check in main.py handles recovery on the next scan.
     """
     validate_token_id(token_id)
     if not (0.01 <= price <= 0.99):
@@ -424,37 +435,34 @@ def close_position(token_id: str, price: float, shares_held: float,
     if dry:
         return f"dry_close_{int(time.time() * 1000)}", "filled", shares_held
 
+    cl = get_clob_client()
+    if cl is None:
+        return None, "failed", None
+
     from py_clob_client_v2.clob_types import OrderArgsV2, PartialCreateOrderOptions
     from py_clob_client_v2.order_builder.constants import SELL
 
-    for attempt in range(3):
-        cl = get_clob_client()
-        if cl is None:
-            return None, "failed", None
-        try:
-            resp = cl.create_and_post_order(
-                OrderArgsV2(token_id=token_id, price=price,
-                            size=round(shares_held, 4), side=SELL),
-                options=PartialCreateOrderOptions(tick_size=get_tick_size(token_id)))
-            # POST was sent — do NOT retry regardless of response shape
-            if not resp or not isinstance(resp, dict):
-                log.error("SELL unexpected response (order may have been placed): %s", resp)
-                return None, "unknown", None
-            oid = resp.get("orderID")
-            if not oid:
-                log.error("Close order rejected — no orderID: %s", resp)
-                return None, "rejected", None
-            _track_order(oid)
-            log.info("Close order placed: %s price=%.3f shares=%.4f", oid[:16], price, shares_held)
-            fill_status, filled_shares = poll_order_status(oid, timeout=25.0)
-            _untrack_order(oid)
-            return oid, fill_status, filled_shares
-        except Exception as e:
-            log.error("Close position error (attempt %d/3): %s", attempt + 1, e)
-            if attempt < 2:
-                time.sleep(0.5 * (2 ** attempt))
-            # Only retry on exception (POST may not have been sent)
-    return None, "failed", None
+    try:
+        resp = cl.create_and_post_order(
+            OrderArgsV2(token_id=token_id, price=price,
+                        size=round(shares_held, 4), side=SELL),
+            options=PartialCreateOrderOptions(tick_size=get_tick_size(token_id)))
+        # POST was sent — do NOT retry regardless of response shape
+        if not resp or not isinstance(resp, dict):
+            log.error("SELL unexpected response (order may have been placed): %s", resp)
+            return None, "unknown", None
+        oid = resp.get("orderID")
+        if not oid:
+            log.error("Close order rejected — no orderID: %s", resp)
+            return None, "rejected", None
+        _track_order(oid)
+        log.info("Close order placed: %s price=%.3f shares=%.4f", oid[:16], price, shares_held)
+        fill_status, filled_shares = poll_order_status(oid, timeout=25.0)
+        _untrack_order(oid)
+        return oid, fill_status, filled_shares
+    except Exception as e:
+        log.error("Close position error: %s", e)
+        return None, "failed", None
 
 
 # ── Redemption ───────────────────────────────────────────────────────────────

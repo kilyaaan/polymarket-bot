@@ -173,8 +173,10 @@ def run(dry: bool = True, hold_enabled: bool = True):
     # Load positions from checkpoint (crash recovery)
     positions: List[Position] = load_checkpoint()
     _missed_pnl = 0.0
+    _missed_count = 0
+    _missed_wins = 0
     if positions:
-        positions, _missed_pnl = reconcile_positions(positions)
+        positions, _missed_pnl, _missed_count, _missed_wins = reconcile_positions(positions)
         save_checkpoint(positions)
         # Re-subscribe recovered positions to Token WS for fast SL/TP detection
         for _rp in positions:
@@ -183,9 +185,12 @@ def run(dry: bool = True, hold_enabled: bool = True):
             log.info("WS re-subscribed recovered pos: %s %s", _rp.direction, _rp.token_id[:16])
 
     stats = SessionStats()
-    if _missed_pnl:
+    if _missed_pnl or _missed_count:
         stats.total_pnl += _missed_pnl
         stats.btc_pnl += _missed_pnl
+        stats.total += _missed_count
+        stats.wins += _missed_wins
+        stats.losses += (_missed_count - _missed_wins)
     threading.Thread(target=lambda: _recap_loop(stats), name="recap", daemon=True).start()
     blacklist = ExpiringBlacklist(ttl=360.0)
     bankroll = sync_wallet_usdc(force=True)
@@ -239,6 +244,12 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                            pos_hit.trail_sl,
                                            round(pos_hit.entry_price + TP_DELTA, 4))
                         continue
+                    # Re-subscribe immediately to eliminate the gap between the
+                    # WS trigger removal and the end of the close attempt.
+                    # Without this, a SL/TP breach during close_position (≤25s)
+                    # would be silently missed. Will be removed on success.
+                    _ws_sl = pos_hit.trail_sl if pos_hit.trail_sl > 0 else round(pos_hit.entry_price - SL_DELTA, 4)
+                    token_ws.subscribe(ws_tid, _ws_sl, round(pos_hit.entry_price + TP_DELTA, 4))
                     # Cancel pre-placed SL order to avoid double-sell
                     if pos_hit.sl_order_id:
                         if not dry:
@@ -260,18 +271,16 @@ def run(dry: bool = True, hold_enabled: bool = True):
                         if close_id is None or fill_status not in ("filled", "partial"):
                             log.warning("WS close failed: %s %s — keeping position",
                                         ws_reason, pos_hit.direction)
-                            # Re-subscribe using current trail_sl (not original SL)
-                            current_sl = pos_hit.trail_sl if pos_hit.trail_sl > 0 else round(pos_hit.entry_price - SL_DELTA, 4)
-                            token_ws.subscribe(ws_tid,
-                                               current_sl,
-                                               round(pos_hit.entry_price + TP_DELTA, 4))
+                            # Subscription already in place (re-subscribed above)
                             continue
                         if fill_status == "partial" and filled_shares_ws is not None:
-                            # Partial fill — update shares, keep position alive
+                            # Partial fill — adjust size_usdc proportionally, keep alive
+                            _sold_frac = filled_shares_ws / max(pos_hit.shares_held, 0.0001)
+                            pos_hit.size_usdc = round(pos_hit.size_usdc * (1.0 - _sold_frac), 4)
                             pos_hit.shares_held -= filled_shares_ws
                             if pos_hit.shares_held > 0:
-                                current_sl = pos_hit.trail_sl if pos_hit.trail_sl > 0 else round(pos_hit.entry_price - SL_DELTA, 4)
-                                token_ws.subscribe(ws_tid, current_sl, round(pos_hit.entry_price + TP_DELTA, 4))
+                                _partial_sl = pos_hit.trail_sl if pos_hit.trail_sl > 0 else round(pos_hit.entry_price - SL_DELTA, 4)
+                                token_ws.subscribe(ws_tid, _partial_sl, round(pos_hit.entry_price + TP_DELTA, 4))
                                 save_checkpoint(positions)
                                 log.warning("WS partial fill %.4f shares remain — keeping position", pos_hit.shares_held)
                                 continue
@@ -279,6 +288,8 @@ def run(dry: bool = True, hold_enabled: bool = True):
                     else:
                         pos_hit.close_order_id = f"dry_ws_{int(time.time()*1000)}"
                         pos_hit.close_fill = "filled"
+                    # Close successful — remove WS monitoring
+                    token_ws.unsubscribe(ws_tid)
                     pos_hit.current_price = exit_price
                     pnl = log_trade(pos_hit, exit_price, reason_ws, stats,
                                     FEED.current, SETTINGS.min_score,
@@ -320,12 +331,24 @@ def run(dry: bool = True, hold_enabled: bool = True):
                         # ── Awaiting expiry resolution (non-blocking) ─────────
                         if pos.awaiting_resolution:
                             _p = pos.current_price
+                            _resolution_timeout = time.time() > pos.market.end_time + 1800
                             if _p >= 0.90:
                                 pos.current_price = 1.0
                                 pos.awaiting_resolution = False
                             elif _p <= 0.10:
                                 pos.current_price = 0.0
                                 pos.awaiting_resolution = False
+                            elif _resolution_timeout:
+                                # 30-min hard timeout — force-close at current price
+                                # to free the position slot and avoid infinite blocking.
+                                log.warning(
+                                    "EXPIRY resolution timeout (>30min) — force-closing %s @%.3f",
+                                    pos.direction, _p)
+                                notify("WARN", f"EXPIRY timeout force-close {pos.direction}",
+                                       **{"Prix": f"{_p:.3f}",
+                                          "Marché": pos.market.question[:30]})
+                                pos.awaiting_resolution = False
+                                # current_price stays at _p (best available)
                             else:
                                 continue  # still uncertain, check next scan
                             # Resolved — cancel any stale SL, log and close
@@ -439,7 +462,7 @@ def run(dry: bool = True, hold_enabled: bool = True):
                         _price_moved_up = pos.current_price > pos.peak_price
                         if _price_moved_up:
                             pos.peak_price = pos.current_price
-                        if pos.trough_price == 0.0 or pos.current_price < pos.trough_price:
+                        if pos.current_price > 0 and (pos.trough_price == 0.0 or pos.current_price < pos.trough_price):
                             pos.trough_price = pos.current_price
 
                         # Trailing stop (only for hold protection — not for normal exits
@@ -543,7 +566,9 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                                         pos.direction, fill_status)
                                             continue
                                         if fill_status == "partial" and filled_shares_close is not None:
-                                            # Partial fill — update shares, keep position alive
+                                            # Partial fill — adjust size_usdc proportionally, keep alive
+                                            _sold_frac = filled_shares_close / max(pos.shares_held, 0.0001)
+                                            pos.size_usdc = round(pos.size_usdc * (1.0 - _sold_frac), 4)
                                             pos.shares_held -= filled_shares_close
                                             if pos.shares_held > 0:
                                                 save_checkpoint(positions)
@@ -602,6 +627,10 @@ def run(dry: bool = True, hold_enabled: bool = True):
                         positions.remove(c)
                     if closed:
                         save_checkpoint(positions)
+                        # Immediate circuit-breaker check — prevents opening new
+                        # entries in the same scan cycle that breached the limit.
+                        if stats.total_pnl <= -SETTINGS.max_daily_loss:
+                            SHUTDOWN_EVENT.set()
 
                 if abs(m15) >= SPIKE_THRESHOLD:
                     stats.spikes_seen += 1
@@ -676,44 +705,48 @@ def run(dry: bool = True, hold_enabled: bool = True):
                         # when multiple entries happen in the same scan cycle
                         _available = bankroll - sum(p.size_usdc for p in positions)
 
-                        for tok, ob in obs.items():
-                            if len(positions) >= MAX_OPEN_POS:
-                                break
-                            mkt, direction = token_map[tok]
-                            if mkt.condition_id in blacklist:
-                                continue
-                            if not ob:
+                        # Pre-score all candidates and sort best-first so the
+                        # highest-quality opportunity is always selected first
+                        # regardless of dict/network ordering.
+                        _scored_entries = []
+                        for _tok, _ob in obs.items():
+                            _mkt, _dir = token_map[_tok]
+                            if not _ob:
                                 scan_state["log"].appendleft({
-                                    "type": "skip", "dir": direction,
+                                    "type": "skip", "dir": _dir,
                                     "reason": "OB empty",
                                     "mom15": m15, "mom60": m60,
                                 })
                                 continue
+                            _rem = _mkt.remaining_min
+                            _wd = ((FEED.current - _mkt.start_price) / _mkt.start_price * 100
+                                   if _mkt.start_price > 0 else 0.0)
+                            _sc, _, _ = compute_score(
+                                _ob, _dir, m15, m30, m60,
+                                remaining_min=_rem, window_delta=_wd,
+                            )
+                            scan_state["avg_edge"] = 0.1 * _sc + 0.9 * scan_state["avg_edge"]
+                            if _sc > scan_state["best_score"]:
+                                scan_state["best_score"] = _sc
+                            SETTINGS.auto_update(scan_state["best_score"])
+                            if _sc < cur_min:
+                                scan_state["log"].appendleft({
+                                    "type": "skip", "dir": _dir,
+                                    "reason": f"score {_sc:.3f}<{cur_min:.2f}",
+                                    "score": _sc, "mom15": m15, "mom60": m60,
+                                })
+                                continue
+                            _scored_entries.append((_sc, _tok, _ob, _mkt, _dir, _rem, _wd))
+                        _scored_entries.sort(key=lambda x: x[0], reverse=True)
+
+                        for score, tok, ob, mkt, direction, remaining, wd in _scored_entries:
+                            if len(positions) >= MAX_OPEN_POS:
+                                break
+                            if mkt.condition_id in blacklist:
+                                continue
                             if direction == "UP" and up_count >= MAX_DIR_POS:
                                 continue
                             if direction == "DOWN" and down_count >= MAX_DIR_POS:
-                                continue
-
-                            remaining = mkt.remaining_min
-                            wd = ((FEED.current - mkt.start_price) / mkt.start_price * 100
-                                  if mkt.start_price > 0 else 0.0)
-                            score, _, _ = compute_score(
-                                ob, direction, m15, m30, m60,
-                                remaining_min=remaining, window_delta=wd,
-                            )
-
-                            # Track best score
-                            scan_state["avg_edge"] = 0.1 * score + 0.9 * scan_state["avg_edge"]
-                            if score > scan_state["best_score"]:
-                                scan_state["best_score"] = score
-                            SETTINGS.auto_update(scan_state["best_score"])
-
-                            if score < cur_min:
-                                scan_state["log"].appendleft({
-                                    "type": "skip", "dir": direction,
-                                    "reason": f"score {score:.3f}<{cur_min:.2f}",
-                                    "score": score, "mom15": m15, "mom60": m60,
-                                })
                                 continue
 
                             # BTC trend filter — block entries against sustained trend
@@ -748,7 +781,8 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                 })
                                 continue
 
-                            size = kelly_size(score, entry_p, bankroll)
+                            # Kelly sized on available capital, not full bankroll
+                            size = kelly_size(score, entry_p, _available)
                             if _available < size:
                                 continue
 
@@ -790,7 +824,7 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                             log.warning("BUY cancel returned OK but order was filled — recovering position: %s", direction)
                                             notify("WARN", f"BUY timeout: cancel OK mais ordre rempli — position récupérée {direction}")
                                             # Fall through to position creation below
-                                        else:
+                                        elif verify_fill in ("cancelled", "canceled"):
                                             # Truly cancelled — blacklist and skip
                                             blacklist.add(mkt.condition_id)
                                             scan_state["log"].appendleft({
@@ -801,6 +835,14 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                             notify("INFO", f"BUY timeout annulé {direction}")
                                             log.warning("BUY timed out — cancelled and blacklisted: %s", direction)
                                             continue
+                                        else:
+                                            # CLOB hasn't reflected state yet ("open") —
+                                            # conservative: track estimated position to
+                                            # ensure SL/TP runs if order was actually filled.
+                                            blacklist.add(mkt.condition_id)
+                                            log.warning("BUY timeout: CLOB uncertain after cancel — tracking estimated position: %s", direction)
+                                            notify("WARN", f"BUY timeout: statut incertain — position estimée trackée {direction}")
+                                            # Fall through to position creation with estimated shares
                                     else:
                                         # Cancel failed — order may have been matched already
                                         # Re-check fill status before giving up

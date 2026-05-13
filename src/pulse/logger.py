@@ -148,13 +148,26 @@ def _notify_worker():
         _notify_queue.task_done()
 
 
-_worker_thread = threading.Thread(target=_notify_worker, name="notify_worker", daemon=True)
-_worker_thread.start()
+_worker_thread: threading.Thread | None = None
+_worker_lock = threading.Lock()
+
+
+def _ensure_notify_worker():
+    """Lazy-start the notify worker on first use (not at import time)."""
+    global _worker_thread
+    if _worker_thread is not None and _worker_thread.is_alive():
+        return
+    with _worker_lock:
+        if _worker_thread is None or not _worker_thread.is_alive():
+            _worker_thread = threading.Thread(
+                target=_notify_worker, name="notify_worker", daemon=True)
+            _worker_thread.start()
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 def notify(level: str, title: str, **fields):
     """Send a structured notification to Telegram and/or Discord."""
+    _ensure_notify_worker()
     if not _rate_ok(level):
         return
     if not TG_TOKEN and not DISCORD_WEBHOOK:

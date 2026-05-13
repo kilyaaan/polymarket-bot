@@ -71,6 +71,8 @@ def _position_to_dict(pos: Position) -> dict:
         "mom30_at_entry": pos.mom30_at_entry,
         "mom60_at_entry": pos.mom60_at_entry,
         "sl_order_id": pos.sl_order_id,
+        "close_order_id": pos.close_order_id,
+        "close_fill": pos.close_fill,
         # Market fields
         "market_condition_id": pos.market.condition_id,
         "market_question": pos.market.question,
@@ -126,6 +128,8 @@ def _dict_to_position(d: dict) -> Position:
         mom30_at_entry=d.get("mom30_at_entry", 0.0),
         mom60_at_entry=d.get("mom60_at_entry", 0.0),
         sl_order_id=d.get("sl_order_id", ""),
+        close_order_id=d.get("close_order_id", ""),
+        close_fill=d.get("close_fill", ""),
     )
 
 
@@ -166,11 +170,14 @@ def reconcile_positions(positions: List[Position]) -> tuple:
     - Expired markets: log as MISSED_EXPIRY, remove
     - API unavailable: keep as unverified, will re-verify on next successful call
 
-    Returns (live_positions, missed_pnl) so the caller can add missed P&L to session stats.
+    Returns (live_positions, missed_pnl, missed_count, missed_wins) so the
+    caller can correctly update all session stats fields (total/wins/losses).
     """
     now = time.time()
     live: List[Position] = []
     missed_pnl = 0.0
+    missed_count = 0
+    missed_wins = 0
     for pos in positions:
         if pos.market.end_time < now:
             log.warning(
@@ -189,12 +196,14 @@ def reconcile_positions(positions: List[Position]) -> tuple:
                 pos.sl_order_id = ""
             pos.close_order_id = "missed_expiry"
             pos.close_fill = "missed_expiry"
-            # Use current_price if it was ever updated (not default 0.0 sentinel)
-            # Don't use `or` — 0.0 is a valid resolution price (losing position)
-            exit_p = pos.current_price if pos.current_price != pos.entry_price else pos.entry_price
+            # Use current_price directly; 0.0 = never updated = conservative loss
+            exit_p = pos.current_price
             pnl = log_trade(pos, exit_p,
                             "MISSED_EXPIRY", _local_stats, 0.0, SETTINGS.min_score)
             missed_pnl += pnl
+            missed_count += 1
+            if pnl >= 0:
+                missed_wins += 1
             tg(f"MISSED_EXPIRY: {pos.direction} {pos.market.question}")
             continue
         pos.verified = False
@@ -208,4 +217,4 @@ def reconcile_positions(positions: List[Position]) -> tuple:
         from pulse.logger import tg
         tg(f"Crash recovery: {len(live)} position(s) recovered, {len(positions) - len(live)} expired")
 
-    return live, missed_pnl
+    return live, missed_pnl, missed_count, missed_wins

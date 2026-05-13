@@ -114,6 +114,7 @@ def compute_score(
 _win_prob_cache: Dict[str, float] = {}
 _win_prob_cache_age: float = 0.0
 _CACHE_TTL = 300.0  # recalculate every 5 minutes
+_win_prob_lock = __import__("threading").Lock()
 
 
 def _load_win_rates(csv_path: Path) -> Dict[str, float]:
@@ -159,10 +160,15 @@ def _load_win_rates(csv_path: Path) -> Dict[str, float]:
 
 
 def _find_best_trades_csv() -> _Path:
-    """Find the most recent non-empty trades CSV for Kelly calibration."""
+    """Find the most recent non-empty trades CSV for Kelly calibration.
+
+    Searches both timestamped exports (crypto_trades_btc_v6_*.csv) and the
+    live trading CSV (crypto_trades_btc_v6.csv) so calibration uses real data.
+    """
     try:
         parent = _Path(str(TRADES_CSV)).parent
-        candidates = sorted(parent.glob("crypto_trades_btc_v6_*.csv"), reverse=True)
+        # glob without trailing _ also matches the non-timestamped live file
+        candidates = sorted(parent.glob("crypto_trades_btc_v6*.csv"), reverse=True)
         for p in candidates:
             if p.stat().st_size > 200:
                 return p
@@ -176,18 +182,20 @@ def _get_win_prob(score: float) -> float:
     global _win_prob_cache, _win_prob_cache_age
     import time
     now = time.time()
-    if now - _win_prob_cache_age > _CACHE_TTL:
-        _win_prob_cache = _load_win_rates(_find_best_trades_csv())
-        _win_prob_cache_age = now
+    with _win_prob_lock:
+        if now - _win_prob_cache_age > _CACHE_TTL:
+            _win_prob_cache = _load_win_rates(_find_best_trades_csv())
+            _win_prob_cache_age = now
+        cache = dict(_win_prob_cache)
 
     if score < 0.60:
-        return _win_prob_cache.get("0.50-0.60", 0.50)
+        return cache.get("0.50-0.60", 0.50)
     elif score < 0.70:
-        return _win_prob_cache.get("0.60-0.70", 0.50)
+        return cache.get("0.60-0.70", 0.50)
     elif score < 0.80:
-        return _win_prob_cache.get("0.70-0.80", 0.50)
+        return cache.get("0.70-0.80", 0.50)
     else:
-        return _win_prob_cache.get("0.80+", 0.50)
+        return cache.get("0.80+", 0.50)
 
 
 def kelly_size(score: float, entry_price: float, bankroll: float) -> float:
