@@ -63,26 +63,36 @@ def _make_scan_state() -> dict:
 
 
 # ── Keyboard handler ────────────────────────────────────────────────────────
+def _handle_key(ch: str) -> None:
+    if ch in ("+", "="):
+        SETTINGS.increase()
+    elif ch == "-":
+        SETTINGS.decrease()
+    elif ch == "r":
+        SETTINGS.reset()
+    elif ch == "a":
+        SETTINGS.toggle_auto()
+    elif ch == "q":
+        SHUTDOWN_EVENT.set()
+
+
 def _keyboard_thread():
     try:
-        import tty, termios
+        import select
+        import tty
+        import termios
         fd = sys.stdin.fileno()
         old = termios.tcgetattr(fd)
         try:
-            tty.setraw(fd)
+            # setcbreak (not setraw): single-key reads without Enter,
+            # but preserves output processing (ONLCR \n→\r\n).
+            # setraw disables ONLCR which causes cursor drift in Rich on SSH.
+            tty.setcbreak(fd)
             while not SHUTDOWN_EVENT.is_set():
-                ch = sys.stdin.read(1).lower()
-                if ch in ("+", "="):
-                    SETTINGS.increase()
-                elif ch == "-":
-                    SETTINGS.decrease()
-                elif ch == "r":
-                    SETTINGS.reset()
-                elif ch == "a":
-                    SETTINGS.toggle_auto()
-                elif ch == "q":
-                    SHUTDOWN_EVENT.set()
-                    break
+                ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if ready:
+                    ch = sys.stdin.read(1).lower()
+                    _handle_key(ch)
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
     except Exception:
