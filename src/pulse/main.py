@@ -260,18 +260,34 @@ def run(dry: bool = True, hold_enabled: bool = True):
                         exit_price = ob_ws["bb"] if ws_reason == "SL" else ob_ws["ba"]
                     else:
                         exit_price = ws_price
+                    # Clamp to CLOB valid range — near-expiry prices can reach 0.99+
+                    exit_price = min(max(exit_price, 0.01), 0.99)
                     reason_ws = (f"SL {exit_price:.3f}(<{round(pos_hit.entry_price - SL_DELTA, 4):.3f})"
                                  if ws_reason == "SL"
                                  else f"TP {exit_price:.3f}(>{round(pos_hit.entry_price + TP_DELTA, 4):.3f})")
                     if not dry:
-                        close_id, fill_status, filled_shares_ws = close_position(
-                            pos_hit.token_id, exit_price, pos_hit.shares_held, dry)
+                        try:
+                            close_id, fill_status, filled_shares_ws = close_position(
+                                pos_hit.token_id, exit_price, pos_hit.shares_held, dry)
+                        except ValueError as _ve:
+                            log.error("WS close skipped — invalid price: %s", _ve)
+                            continue
                         pos_hit.close_order_id = close_id if close_id else "failed"
                         pos_hit.close_fill = fill_status
                         if close_id is None or fill_status not in ("filled", "partial"):
                             log.warning("WS close failed: %s %s — keeping position",
                                         ws_reason, pos_hit.direction)
-                            # Subscription already in place (re-subscribed above)
+                            # If price is near resolution the CLOB rejects all orders
+                            # (market locked). Re-subscribing would cause an immediate
+                            # re-trigger loop. Switch to hold-to-expiry instead.
+                            if exit_price >= 0.88 or ws_price >= 0.88:
+                                pos_hit.holding_expiry = True
+                                token_ws.unsubscribe(ws_tid)
+                                log.warning("WS close rejected near resolution — hold-to-expiry: %s",
+                                            pos_hit.direction)
+                                notify("HOLD", f"Close rejeté (marché verrouillé) — hold expiry {pos_hit.direction}",
+                                       **{"Prix": f"{exit_price:.3f}"})
+                            # else: subscription already in place (re-subscribed above)
                             continue
                         if fill_status == "partial" and filled_shares_ws is not None:
                             # Partial fill — adjust size_usdc proportionally, keep alive
@@ -536,7 +552,7 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                                     pos.direction, pos.token_id[:16])
                                         continue
 
-                                    exit_price = max(ob2["bb"], 0.01)
+                                    exit_price = min(max(ob2["bb"], 0.01), 0.99)
                                     try:
                                         close_id, fill_status, filled_shares_close = close_position(
                                             pos.token_id, exit_price, pos.shares_held, dry)
