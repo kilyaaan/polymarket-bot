@@ -257,7 +257,7 @@ def run(dry: bool = True, hold_enabled: bool = True):
                         pos_hit.sl_order_id = ""
                     ob_ws = get_ob(pos_hit.token_id)
                     if ob_ws:
-                        exit_price = ob_ws["bb"] if ws_reason == "SL" else ob_ws["ba"]
+                        exit_price = ob_ws["bb"]  # always sell at best bid (SELL order)
                     else:
                         exit_price = ws_price
                     # Clamp to CLOB valid range — near-expiry prices can reach 0.99+
