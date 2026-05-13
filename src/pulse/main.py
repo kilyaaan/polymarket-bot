@@ -237,21 +237,11 @@ def run(dry: bool = True, hold_enabled: bool = True):
                     pos_hit = next((p for p in positions if p.token_id == ws_tid), None)
                     if pos_hit is None:
                         continue  # already closed
-                    # Activate hold-to-expiry here if conditions are met but the
-                    # scan loop hasn't run yet (race condition: WS can fire TP
-                    # before the first scan activates holding_expiry).
-                    if (hold_enabled
-                            and not pos_hit.holding_expiry
-                            and pos_hit.current_price >= HOLD_THRESHOLD
-                            and pos_hit.market.remaining_sec >= HOLD_MIN_REMAINING):
-                        pos_hit.holding_expiry = True
-                        log.info("Hold-to-expiry activated in WS handler: %s @%.3f",
-                                 pos_hit.direction, pos_hit.current_price)
-                    if pos_hit.holding_expiry:
-                        # Hold positions: SL and TP both handled by scan loop.
-                        # Never close via WS — let the market resolve at 1.0 or 0.0.
-                        _hold_sl = pos_hit.trail_sl if pos_hit.trail_sl > 0 else round(pos_hit.entry_price - SL_DELTA, 4)
-                        token_ws.subscribe(ws_tid, _hold_sl,
+                    if pos_hit.holding_expiry and ws_reason == "SL":
+                        # Don't exit hold positions on SL via WS —
+                        # the hold SL check in the loop handles this
+                        token_ws.subscribe(ws_tid,
+                                           pos_hit.trail_sl,
                                            round(pos_hit.entry_price + TP_DELTA, 4))
                         continue
                     # Re-subscribe immediately to eliminate the gap between the
@@ -267,7 +257,16 @@ def run(dry: bool = True, hold_enabled: bool = True):
                         pos_hit.sl_order_id = ""
                     ob_ws = get_ob(pos_hit.token_id)
                     if ob_ws:
-                        exit_price = ob_ws["bb"]  # always sell at best bid (SELL order)
+                        if ws_reason == "SL":
+                            # SL: sell aggressively at best bid for immediate fill
+                            exit_price = ob_ws["bb"]
+                        else:
+                            # TP: use mid-price so the limit order sits at the TP level.
+                            # Selling at raw bid (which can be 0.20 below mid near
+                            # resolution) gives terrible execution. A passive limit at
+                            # mid either fills at a fair price or stays open, keeping
+                            # the position alive for potential full resolution at 1.0.
+                            exit_price = round((ob_ws["bb"] + ob_ws["ba"]) / 2, 4)
                     else:
                         exit_price = ws_price
                     # Clamp to CLOB valid range — near-expiry prices can reach 0.99+
