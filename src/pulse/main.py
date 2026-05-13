@@ -759,18 +759,40 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                     log.warning("BUY cancelled: %s", direction)
                                     continue
                                 if buy_fill == "open":
-                                    # Order not confirmed — cancel and blacklist to avoid re-entry
-                                    # (cancel may fail if order was already matched on-chain)
-                                    cancel_order_safe(order_id)
-                                    blacklist.add(mkt.condition_id)
-                                    scan_state["log"].appendleft({
-                                        "type": "skip", "dir": direction,
-                                        "reason": "BUY timeout — annulé + blacklist",
-                                        "mom15": m15, "mom60": m60,
-                                    })
-                                    notify("INFO", f"BUY timeout annulé {direction}")
-                                    log.warning("BUY timed out — cancelled and blacklisted: %s", direction)
-                                    continue
+                                    # Order unconfirmed after timeout — try to cancel
+                                    cancelled = cancel_order_safe(order_id)
+                                    if cancelled:
+                                        # Truly cancelled — blacklist and skip
+                                        blacklist.add(mkt.condition_id)
+                                        scan_state["log"].appendleft({
+                                            "type": "skip", "dir": direction,
+                                            "reason": "BUY timeout — annulé + blacklist",
+                                            "mom15": m15, "mom60": m60,
+                                        })
+                                        notify("INFO", f"BUY timeout annulé {direction}")
+                                        log.warning("BUY timed out — cancelled and blacklisted: %s", direction)
+                                        continue
+                                    else:
+                                        # Cancel failed — order may have been matched already
+                                        # Re-check fill status before giving up
+                                        fill_retry, shares_retry = poll_order_status(order_id, timeout=8.0)
+                                        if fill_retry in ("matched", "filled"):
+                                            # Order was filled — recover position
+                                            if shares_retry is not None:
+                                                actual_shares = shares_retry
+                                            log.warning("BUY timeout but order was filled — recovering position: %s", direction)
+                                            # Fall through to position creation below
+                                        else:
+                                            # Still unknown — blacklist to prevent re-entry
+                                            blacklist.add(mkt.condition_id)
+                                            scan_state["log"].appendleft({
+                                                "type": "skip", "dir": direction,
+                                                "reason": "BUY timeout — cancel failed + blacklist",
+                                                "mom15": m15, "mom60": m60,
+                                            })
+                                            notify("INFO", f"BUY timeout cancel failed {direction}")
+                                            log.warning("BUY timed out and cancel failed — blacklisted: %s", direction)
+                                            continue
                                 if filled_shares is not None:
                                     actual_shares = filled_shares
                                     log.info("Fill verified: %.4f shares (local est: %.4f)",
