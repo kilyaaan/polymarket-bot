@@ -779,16 +779,28 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                     # Order unconfirmed after timeout — try to cancel
                                     cancelled = cancel_order_safe(order_id)
                                     if cancelled:
-                                        # Truly cancelled — blacklist and skip
-                                        blacklist.add(mkt.condition_id)
-                                        scan_state["log"].appendleft({
-                                            "type": "skip", "dir": direction,
-                                            "reason": "BUY timeout — annulé + blacklist",
-                                            "mom15": m15, "mom60": m60,
-                                        })
-                                        notify("INFO", f"BUY timeout annulé {direction}")
-                                        log.warning("BUY timed out — cancelled and blacklisted: %s", direction)
-                                        continue
+                                        # Cancel API returned OK — but verify: Polymarket
+                                        # returns 200 even on already-filled orders.
+                                        verify_fill, verify_shares = poll_order_status(order_id, timeout=6.0)
+                                        if verify_fill in ("matched", "filled"):
+                                            # Order was actually filled — recover position
+                                            if verify_shares is not None:
+                                                actual_shares = verify_shares
+                                            blacklist.add(mkt.condition_id)
+                                            log.warning("BUY cancel returned OK but order was filled — recovering position: %s", direction)
+                                            notify("WARN", f"BUY timeout: cancel OK mais ordre rempli — position récupérée {direction}")
+                                            # Fall through to position creation below
+                                        else:
+                                            # Truly cancelled — blacklist and skip
+                                            blacklist.add(mkt.condition_id)
+                                            scan_state["log"].appendleft({
+                                                "type": "skip", "dir": direction,
+                                                "reason": "BUY timeout — annulé + blacklist",
+                                                "mom15": m15, "mom60": m60,
+                                            })
+                                            notify("INFO", f"BUY timeout annulé {direction}")
+                                            log.warning("BUY timed out — cancelled and blacklisted: %s", direction)
+                                            continue
                                     else:
                                         # Cancel failed — order may have been matched already
                                         # Re-check fill status before giving up
