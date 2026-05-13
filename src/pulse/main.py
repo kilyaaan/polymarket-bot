@@ -275,6 +275,31 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                  if ws_reason == "SL"
                                  else f"TP {exit_price:.3f}(>{round(pos_hit.entry_price + TP_DELTA, 4):.3f})")
                     if not dry:
+                        # Stale close order guard — prevent double-sell.
+                        # A passive TP order (placed at mid-price) may not fill in
+                        # the 25s poll window and sit as a resting order in the book.
+                        # When the WS re-fires (re-subscribed above), we must cancel
+                        # that resting order before placing a new one, otherwise we
+                        # end up with two SELL orders for the same position.
+                        _prev_cid = pos_hit.close_order_id
+                        if _prev_cid and _prev_cid not in (
+                                "", "failed", "expiry_resolution", "missed_expiry"):
+                            _prev_status, _ = poll_order_status(_prev_cid, timeout=3.0)
+                            if _prev_status in ("filled", "partial"):
+                                # Previous order already closed the position — this WS
+                                # event is stale. Unsubscribe and let the scan loop
+                                # log the trade when it next hits TP/SL/EXPIRY.
+                                log.warning(
+                                    "WS: prev close %s already %s — skipping duplicate %s",
+                                    _prev_cid[:16], _prev_status, pos_hit.direction)
+                                pos_hit.close_fill = _prev_status
+                                token_ws.unsubscribe(ws_tid)
+                                continue
+                            # Still open (resting order) — cancel before retrying
+                            cancel_order_safe(_prev_cid)
+                            pos_hit.close_order_id = ""
+                            log.info("WS: cancelled stale close %s, retrying %s",
+                                     _prev_cid[:16], pos_hit.direction)
                         try:
                             close_id, fill_status, filled_shares_ws = close_position(
                                 pos_hit.token_id, exit_price, pos_hit.shares_held, dry)
