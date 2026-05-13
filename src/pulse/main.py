@@ -109,7 +109,7 @@ def _keyboard_thread():
 
 # ── Main loop ────────────────────────────────────────────────────────────────
 def run(dry: bool = True, hold_enabled: bool = True):
-    console = Console()
+    console = Console(force_terminal=True)
     setup_logging()
     init_csv()
 
@@ -891,7 +891,7 @@ def validate():
     order construction (signed but NOT posted), wallet balance.
     """
     import traceback
-    console = Console()
+    console = Console(force_terminal=True)
     ok = True
 
     def _check(label: str, fn):
