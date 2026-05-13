@@ -286,14 +286,38 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                 "", "failed", "expiry_resolution", "missed_expiry"):
                             _prev_status, _ = poll_order_status(_prev_cid, timeout=3.0)
                             if _prev_status in ("filled", "partial"):
-                                # Previous order already closed the position — this WS
-                                # event is stale. Unsubscribe and let the scan loop
-                                # log the trade when it next hits TP/SL/EXPIRY.
+                                # Previous order already closed the position.
+                                # Log the trade inline (ws_price ≈ fill price) and
+                                # remove — don't defer to scan loop which would log
+                                # at the wrong price (expiry or current bid).
                                 log.warning(
-                                    "WS: prev close %s already %s — skipping duplicate %s",
+                                    "WS: prev close %s already %s — logging inline %s",
                                     _prev_cid[:16], _prev_status, pos_hit.direction)
+                                _stale_exit = min(max(ws_price, 0.01), 0.99)
                                 pos_hit.close_fill = _prev_status
+                                pos_hit.current_price = _stale_exit
                                 token_ws.unsubscribe(ws_tid)
+                                _reason_stale = (f"TP(stale) {_stale_exit:.3f}"
+                                                 if ws_reason == "TP"
+                                                 else f"SL(stale) {_stale_exit:.3f}")
+                                pnl = log_trade(pos_hit, _stale_exit, _reason_stale,
+                                                stats, FEED.current, SETTINGS.min_score,
+                                                mom15_exit=m15, rsi_exit=FEED.rsi())
+                                stats.total_pnl += pnl
+                                stats.total += 1
+                                if pnl >= 0:
+                                    stats.wins += 1
+                                else:
+                                    stats.losses += 1
+                                _lvl = "WIN" if pnl >= 0 else "LOSS"
+                                notify(_lvl, f"{_lvl} — BTC {pos_hit.direction}",
+                                       **{"P&L net": f"{pnl:+.2f}$",
+                                          "Raison": _reason_stale.split()[0],
+                                          "Fill": _prev_status,
+                                          "Session P&L": f"{stats.total_pnl:+.2f}$"})
+                                positions.remove(pos_hit)
+                                save_checkpoint(positions)
+                                bankroll = sync_wallet_usdc(force=True)
                                 continue
                             # Still open (resting order) — cancel before retrying
                             cancel_order_safe(_prev_cid)
@@ -627,6 +651,12 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                         bankroll = sync_wallet_usdc(force=True)
                                 pos.current_price = exit_price
                             else:
+                                # Cancel any resting WS close order before EXPIRY
+                                # (passive TP order that never filled stays in book)
+                                _expiry_prev = pos.close_order_id
+                                if (not dry and _expiry_prev and _expiry_prev not in (
+                                        "", "failed", "expiry_resolution", "missed_expiry")):
+                                    cancel_order_safe(_expiry_prev)
                                 pos.close_order_id = "expiry_resolution"
                                 pos.close_fill = "expiry"
                                 # Snap to clean resolution price (0.0 or 1.0)
