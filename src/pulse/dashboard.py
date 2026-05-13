@@ -84,8 +84,8 @@ def make_dashboard(
 
     recent = FEED.last_n(14)
     price_tbl = Table(box=None, show_header=False, padding=(0, 0), expand=True)
-    price_tbl.add_column(justify="left", no_wrap=False)
-    price_tbl.add_column(justify="right", no_wrap=False)
+    price_tbl.add_column(justify="left", no_wrap=True)
+    price_tbl.add_column(justify="right", no_wrap=True)
     for i in range(0, len(recent) - 1, 2):
         p1 = recent[i]
         p2 = recent[i + 1] if i + 1 < len(recent) else p1

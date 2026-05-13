@@ -109,7 +109,7 @@ def _keyboard_thread():
 
 # ── Main loop ────────────────────────────────────────────────────────────────
 def run(dry: bool = True, hold_enabled: bool = True):
-    console = Console(force_terminal=True, force_jupyter=False)
+    console = Console()
     setup_logging()
     init_csv()
 
