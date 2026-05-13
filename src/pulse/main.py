@@ -253,7 +253,7 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                  if ws_reason == "SL"
                                  else f"TP {exit_price:.3f}(>{round(pos_hit.entry_price + TP_DELTA, 4):.3f})")
                     if not dry:
-                        close_id, fill_status = close_position(
+                        close_id, fill_status, filled_shares_ws = close_position(
                             pos_hit.token_id, exit_price, pos_hit.shares_held, dry)
                         pos_hit.close_order_id = close_id if close_id else "failed"
                         pos_hit.close_fill = fill_status
@@ -266,6 +266,15 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                                current_sl,
                                                round(pos_hit.entry_price + TP_DELTA, 4))
                             continue
+                        if fill_status == "partial" and filled_shares_ws is not None:
+                            # Partial fill — update shares, keep position alive
+                            pos_hit.shares_held -= filled_shares_ws
+                            if pos_hit.shares_held > 0:
+                                current_sl = pos_hit.trail_sl if pos_hit.trail_sl > 0 else round(pos_hit.entry_price - SL_DELTA, 4)
+                                token_ws.subscribe(ws_tid, current_sl, round(pos_hit.entry_price + TP_DELTA, 4))
+                                save_checkpoint(positions)
+                                log.warning("WS partial fill %.4f shares remain — keeping position", pos_hit.shares_held)
+                                continue
                         bankroll = sync_wallet_usdc(force=True)
                     else:
                         pos_hit.close_order_id = f"dry_ws_{int(time.time()*1000)}"
@@ -362,7 +371,7 @@ def run(dry: bool = True, hold_enabled: bool = True):
                         # The SL order sits in the CLOB book and executes at the
                         # exact SL price — no scan-loop slippage.
                         if pos.sl_order_id and not pos.holding_expiry:
-                            sl_status, _ = poll_order_status(pos.sl_order_id, timeout=1.0)
+                            sl_status, _ = poll_order_status(pos.sl_order_id, timeout=3.0)
                             if sl_status in ("filled", "partial"):
                                 # Use the actual SL execution price, not current OB bid
                                 exit_price = pos.trail_sl if pos.trail_sl > 0 else round(pos.entry_price - SL_DELTA, 4)
@@ -506,7 +515,7 @@ def run(dry: bool = True, hold_enabled: bool = True):
 
                                     exit_price = max(ob2["bb"], 0.01)
                                     try:
-                                        close_id, fill_status = close_position(
+                                        close_id, fill_status, filled_shares_close = close_position(
                                             pos.token_id, exit_price, pos.shares_held, dry)
                                     except ValueError as _ve:
                                         log.error("Close skipped — invalid price: %s", _ve)
@@ -533,6 +542,13 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                             log.warning("SELL not filled: %s %s",
                                                         pos.direction, fill_status)
                                             continue
+                                        if fill_status == "partial" and filled_shares_close is not None:
+                                            # Partial fill — update shares, keep position alive
+                                            pos.shares_held -= filled_shares_close
+                                            if pos.shares_held > 0:
+                                                save_checkpoint(positions)
+                                                log.warning("Partial fill %.4f shares remain — keeping position", pos.shares_held)
+                                                continue
                                         bankroll = sync_wallet_usdc(force=True)
                                 pos.current_price = exit_price
                             else:
@@ -796,6 +812,7 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                     log.info("Fill verified: %.4f shares (local est: %.4f)",
                                              filled_shares, shares)
                                 bankroll = sync_wallet_usdc(force=True)
+                                _available = bankroll - sum(p.size_usdc for p in positions)
 
                             sl_price = round(entry_p - SL_DELTA, 4)
                             sl_oid = place_limit_sell(tok, sl_price, actual_shares, dry)

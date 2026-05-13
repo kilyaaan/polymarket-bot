@@ -410,8 +410,11 @@ def place_limit_sell(token_id: str, price: float, shares: float,
 
 
 def close_position(token_id: str, price: float, shares_held: float,
-                   dry: bool = True) -> Tuple[Optional[str], str]:
-    """Place a SELL order to close a position."""
+                   dry: bool = True) -> Tuple[Optional[str], str, Optional[float]]:
+    """Place a SELL order to close a position.
+    Returns (order_id, fill_status, filled_shares).
+    Never retries after POST is sent — avoids duplicate SELL orders.
+    """
     validate_token_id(token_id)
     if not (0.01 <= price <= 0.99):
         raise ValueError(f"SELL price out of bounds: {price}")
@@ -419,38 +422,39 @@ def close_position(token_id: str, price: float, shares_held: float,
         raise ValueError(f"SELL shares invalid: {shares_held}")
 
     if dry:
-        return f"dry_close_{int(time.time() * 1000)}", "filled"
+        return f"dry_close_{int(time.time() * 1000)}", "filled", shares_held
 
-    def _do():
+    from py_clob_client_v2.clob_types import OrderArgsV2, PartialCreateOrderOptions
+    from py_clob_client_v2.order_builder.constants import SELL
+
+    for attempt in range(3):
+        cl = get_clob_client()
+        if cl is None:
+            return None, "failed", None
         try:
-            from py_clob_client_v2.clob_types import OrderArgsV2, PartialCreateOrderOptions
-            from py_clob_client_v2.order_builder.constants import SELL
-            cl = get_clob_client()
-            if cl is None:
-                return None
             resp = cl.create_and_post_order(
                 OrderArgsV2(token_id=token_id, price=price,
                             size=round(shares_held, 4), side=SELL),
                 options=PartialCreateOrderOptions(tick_size=get_tick_size(token_id)))
+            # POST was sent — do NOT retry regardless of response shape
             if not resp or not isinstance(resp, dict):
-                return None
+                log.error("SELL unexpected response (order may have been placed): %s", resp)
+                return None, "unknown", None
             oid = resp.get("orderID")
             if not oid:
                 log.error("Close order rejected — no orderID: %s", resp)
-                return None
+                return None, "rejected", None
             _track_order(oid)
             log.info("Close order placed: %s price=%.3f shares=%.4f", oid[:16], price, shares_held)
-            return oid
+            fill_status, filled_shares = poll_order_status(oid, timeout=25.0)
+            _untrack_order(oid)
+            return oid, fill_status, filled_shares
         except Exception as e:
-            log.error("Close position error: %s", e)
-            return None
-
-    order_id = _retry_order(_do)
-    if order_id is None:
-        return None, "failed"
-    fill_status, _ = poll_order_status(order_id, timeout=25.0)
-    _untrack_order(order_id)
-    return order_id, fill_status
+            log.error("Close position error (attempt %d/3): %s", attempt + 1, e)
+            if attempt < 2:
+                time.sleep(0.5 * (2 ** attempt))
+            # Only retry on exception (POST may not have been sent)
+    return None, "failed", None
 
 
 # ── Redemption ───────────────────────────────────────────────────────────────

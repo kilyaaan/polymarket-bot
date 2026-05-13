@@ -181,10 +181,18 @@ def reconcile_positions(positions: List[Position]) -> tuple:
             )
             from pulse.logger import tg, log_trade
             from pulse.config import SessionStats, SETTINGS
+            from pulse.orders import cancel_order_safe
             _local_stats = SessionStats()
+            # Cancel any resting SL order before logging expiry
+            if pos.sl_order_id:
+                cancel_order_safe(pos.sl_order_id)
+                pos.sl_order_id = ""
             pos.close_order_id = "missed_expiry"
             pos.close_fill = "missed_expiry"
-            pnl = log_trade(pos, pos.current_price or pos.entry_price,
+            # Use current_price if it was ever updated (not default 0.0 sentinel)
+            # Don't use `or` — 0.0 is a valid resolution price (losing position)
+            exit_p = pos.current_price if pos.current_price != pos.entry_price else pos.entry_price
+            pnl = log_trade(pos, exit_p,
                             "MISSED_EXPIRY", _local_stats, 0.0, SETTINGS.min_score)
             missed_pnl += pnl
             tg(f"MISSED_EXPIRY: {pos.direction} {pos.market.question}")
