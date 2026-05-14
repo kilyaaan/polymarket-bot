@@ -959,7 +959,15 @@ def run(dry: bool = True, hold_enabled: bool = True):
 
                             sl_price = round(entry_p - SL_DELTA, 4)
                             sl_oid = place_limit_sell(tok, sl_price, actual_shares, dry)
-                            if sl_oid:
+                            if sl_oid == "no_balance":
+                                # balance=0 means BUY was never filled — phantom position.
+                                # Discard immediately rather than tracking a ghost trade.
+                                log.error("SL pre-placement: balance=0 — BUY not filled, "
+                                          "discarding phantom position %s", direction)
+                                notify("INFO", f"Position fantôme ignorée {direction}",
+                                       **{"Raison": "BUY annulé / pas rempli (balance CLOB = 0)"})
+                                continue
+                            elif sl_oid:
                                 log.info("SL pre-placed: %s @%.3f", sl_oid[:16], sl_price)
                             else:
                                 log.warning("SL pre-placement failed for %s — scan-based fallback",

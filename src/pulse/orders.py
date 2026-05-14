@@ -413,6 +413,10 @@ def place_limit_sell(token_id: str, price: float, shares: float,
                  oid[:16], price, shares)
         return oid
     except Exception as e:
+        err = str(e).lower()
+        if "balance" in err and ("balance: 0" in err or "not enough balance" in err):
+            log.error("Place SL order rejected — no balance (BUY not filled): %s", e)
+            return "no_balance"
         log.error("Place SL order error: %s", e)
         return None
 
