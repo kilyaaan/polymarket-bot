@@ -333,19 +333,28 @@ def run(dry: bool = True, hold_enabled: bool = True):
                         pos_hit.close_order_id = close_id if close_id else "failed"
                         pos_hit.close_fill = fill_status
                         if close_id is None or fill_status not in ("filled", "partial"):
-                            log.warning("WS close failed: %s %s — keeping position",
-                                        ws_reason, pos_hit.direction)
-                            # If price is near resolution the CLOB rejects all orders
-                            # (market locked). Re-subscribing would cause an immediate
-                            # re-trigger loop. Switch to hold-to-expiry instead.
-                            if exit_price >= 0.88 or ws_price >= 0.88:
+                            if fill_status == "no_balance":
+                                # BUY order was never filled — phantom position.
+                                # No tokens held, no PnL to log. Remove silently.
+                                log.error("WS: no balance on SELL — phantom position removed: %s",
+                                          pos_hit.direction)
+                                notify("INFO", f"Position fantôme retirée {pos_hit.direction}",
+                                       **{"Raison": "BUY jamais rempli (balance CLOB = 0)"})
+                                token_ws.unsubscribe(ws_tid)
+                                positions.remove(pos_hit)
+                                save_checkpoint(positions)
+                                continue
+                            # Any CLOB rejection (400) or near-resolution price → hold-to-expiry.
+                            # Re-subscribing after a rejection causes an immediate re-trigger
+                            # loop (20+ calls/sec). Hold is safer than looping.
+                            if fill_status in ("rejected",) or exit_price >= 0.88 or ws_price >= 0.88:
                                 pos_hit.holding_expiry = True
                                 token_ws.unsubscribe(ws_tid)
-                                log.warning("WS close rejected near resolution — hold-to-expiry: %s",
+                                log.warning("WS close rejected — hold-to-expiry: %s",
                                             pos_hit.direction)
-                                notify("HOLD", f"Close rejeté (marché verrouillé) — hold expiry {pos_hit.direction}",
+                                notify("HOLD", f"Close rejeté — hold expiry {pos_hit.direction}",
                                        **{"Prix": f"{exit_price:.3f}"})
-                            # else: subscription already in place (re-subscribed above)
+                            # else: network failure — subscription in place, will retry
                             continue
                         if fill_status == "partial" and filled_shares_ws is not None:
                             # Partial fill — adjust size_usdc proportionally, keep alive

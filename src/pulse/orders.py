@@ -461,6 +461,15 @@ def close_position(token_id: str, price: float, shares_held: float,
         _untrack_order(oid)
         return oid, fill_status, filled_shares
     except Exception as e:
+        err = str(e).lower()
+        if "balance" in err and ("balance: 0" in err or "not enough balance" in err):
+            # No tokens held — BUY order was never filled (phantom position)
+            log.error("Close rejected — no balance (phantom position): %s", e)
+            return None, "no_balance", None
+        if "400" in err or "bad request" in err:
+            # Other CLOB rejection (market locked, etc.)
+            log.error("Close rejected by CLOB (400): %s", e)
+            return None, "rejected", None
         log.error("Close position error: %s", e)
         return None, "failed", None
 
