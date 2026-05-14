@@ -334,12 +334,46 @@ def run(dry: bool = True, hold_enabled: bool = True):
                         pos_hit.close_fill = fill_status
                         if close_id is None or fill_status not in ("filled", "partial"):
                             if fill_status == "no_balance":
-                                # BUY order was never filled — phantom position.
-                                # No tokens held, no PnL to log. Remove silently.
-                                log.error("WS: no balance on SELL — phantom position removed: %s",
-                                          pos_hit.direction)
-                                notify("INFO", f"Position fantôme retirée {pos_hit.direction}",
-                                       **{"Raison": "BUY jamais rempli (balance CLOB = 0)"})
+                                # "no_balance" can mean either:
+                                # A) BUY never filled (true phantom)
+                                # B) BUY filled but tokens already spent by the
+                                #    pre-placed SL order (race vs HOLD cancel).
+                                # Check the original BUY order status to tell apart.
+                                _buy_chk, _ = poll_order_status(
+                                    pos_hit.order_id, timeout=3.0)
+                                if _buy_chk in ("filled", "partial"):
+                                    # Case B: real trade, closed by SL in CLOB book.
+                                    # Use current_price as best estimate of fill
+                                    # (actual CLOB fill price not available via API).
+                                    _cbe = min(max(
+                                        pos_hit.current_price if pos_hit.current_price > 0.01
+                                        else ws_price, 0.01), 0.99)
+                                    log.warning(
+                                        "WS no_balance but BUY filled — SL closed: %s @~%.3f",
+                                        pos_hit.direction, _cbe)
+                                    pnl = log_trade(
+                                        pos_hit, _cbe, "SL_auto", stats,
+                                        FEED.current, SETTINGS.min_score,
+                                        mom15_exit=m15, rsi_exit=FEED.rsi())
+                                    stats.total_pnl += pnl
+                                    stats.total += 1
+                                    if pnl >= 0:
+                                        stats.wins += 1
+                                    else:
+                                        stats.losses += 1
+                                    _lvl = "WIN" if pnl >= 0 else "LOSS"
+                                    notify(_lvl, f"{_lvl} — BTC {pos_hit.direction}",
+                                           **{"P&L net": f"{pnl:+.2f}$",
+                                              "Raison": "SL auto (CLOB)",
+                                              "Fill": "SL_book",
+                                              "Session P&L": f"{stats.total_pnl:+.2f}$"})
+                                else:
+                                    # Case A: true phantom — BUY was never filled.
+                                    log.error(
+                                        "WS: no balance on SELL — phantom position: %s",
+                                        pos_hit.direction)
+                                    notify("INFO", f"Position fantôme retirée {pos_hit.direction}",
+                                           **{"Raison": "BUY jamais rempli (balance CLOB = 0)"})
                                 token_ws.unsubscribe(ws_tid)
                                 positions.remove(pos_hit)
                                 save_checkpoint(positions)
@@ -522,10 +556,56 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                 and not pos.holding_expiry
                                 and pos.current_price >= HOLD_THRESHOLD
                                 and rem_sec >= HOLD_MIN_REMAINING):
-                            # Cancel pre-placed SL before holding to expiry
+                            # Cancel pre-placed SL before holding to expiry.
+                            # Race guard: SL may have matched between the
+                            # poll above (returned "open") and this cancel.
                             if pos.sl_order_id:
                                 if not dry:
                                     cancel_order_safe(pos.sl_order_id)
+                                    # Poll one final time — if it filled during
+                                    # the cancel window, log and close now.
+                                    _sl_race, _ = poll_order_status(
+                                        pos.sl_order_id, timeout=2.0)
+                                    if _sl_race in ("filled", "partial"):
+                                        # SL executed (price-improved by CLOB).
+                                        # Use current OB bid as best estimate
+                                        # (actual fill price not returned by API).
+                                        _sl_race_exit = pos.current_price
+                                        _reason_slr = f"SL_auto {_sl_race_exit:.3f}"
+                                        pos.close_order_id = pos.sl_order_id
+                                        pos.close_fill = _sl_race
+                                        pos.sl_order_id = ""
+                                        pos.current_price = _sl_race_exit
+                                        token_ws.unsubscribe(pos.token_id)
+                                        bankroll = sync_wallet_usdc(force=True)
+                                        pnl = log_trade(
+                                            pos, _sl_race_exit, _reason_slr, stats,
+                                            FEED.current, SETTINGS.min_score,
+                                            mom15_exit=m15, rsi_exit=FEED.rsi())
+                                        stats.total_pnl += pnl
+                                        stats.total += 1
+                                        if pnl >= 0:
+                                            stats.wins += 1
+                                        else:
+                                            stats.losses += 1
+                                        scan_state["log"].appendleft({
+                                            "type": "exit", "dir": pos.direction,
+                                            "reason": _reason_slr, "pnl": round(pnl, 2),
+                                            "pnl_pct": round(pos.pnl_pct * 100, 1),
+                                            "size": round(pos.size_usdc, 2),
+                                            "entry": round(pos.entry_price, 4),
+                                            "mom15": m15, "mom60": m60,
+                                        })
+                                        _level = "WIN" if pnl >= 0 else "LOSS"
+                                        notify(_level, f"{_level} — BTC {pos.direction}",
+                                               **{"P&L net": f"{pnl:+.2f}$",
+                                                  "Raison": "SL auto (CLOB)",
+                                                  "Durée": f"{pos.elapsed_min:.1f} min",
+                                                  "Score entrée": f"{pos.score:.3f}",
+                                                  "Fill": _sl_race,
+                                                  "Session P&L": f"{stats.total_pnl:+.2f}$"})
+                                        closed.append(pos)
+                                        continue  # skip hold activation
                                 pos.sl_order_id = ""
                             pos.holding_expiry = True
                             stats.held_expiry += 1
