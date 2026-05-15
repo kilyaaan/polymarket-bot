@@ -669,6 +669,16 @@ def run(dry: bool = True, hold_enabled: bool = True):
                             if ob2:
                                 pos.current_price = ob2["mid"]
 
+                            # If market is expired with no OB, force EXPIRY instead of
+                            # looping on "CLOSE SKIP — no OB" indefinitely.
+                            if (reason != "EXPIRY" and ob2 is None
+                                    and pos.holding_expiry
+                                    and pos.market.remaining_min <= 0):
+                                log.warning(
+                                    "No OB on expired market — forcing EXPIRY: %s (was %s)",
+                                    pos.direction, reason)
+                                reason = "EXPIRY"
+
                             if reason != "EXPIRY":
                                 # ── Safety: resolve any stale pending close order ──────
                                 _skip_placement = False
