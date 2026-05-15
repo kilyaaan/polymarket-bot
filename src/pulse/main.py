@@ -27,7 +27,7 @@ from pulse.config import (
 from pulse.feed import FEED, SPIKE_INTERRUPT, start_ws_btc, rest_fallback_btc, spike_monitor_loop, prewarm_connections
 from pulse.strategy import compute_score, kelly_size, vote_direction, has_overlapping_position
 from pulse.orders import (
-    place_order, poll_order_status, close_position, place_limit_sell,
+    place_order, poll_order_status, close_position,
     cancel_all_pending, cancel_order_safe,
     get_ob, get_ob_multi, get_cached_markets, get_fee_rate, get_tick_size,
     sync_wallet_usdc, redeem_loop, prefetch_loop, shutdown_ob_pool,
@@ -644,7 +644,8 @@ def run(dry: bool = True, hold_enabled: bool = True):
                         if pos.holding_expiry:
                             if pos.current_price <= eff_sl:
                                 reason = f"SL(hold) {pos.current_price:.3f}(<{eff_sl:.3f})"
-                                pos.holding_expiry = False
+                                # Do NOT reset holding_expiry — WS handler checks it to
+                                # skip redundant SL events and prevent double-close.
                             elif rem_sec <= 9:
                                 reason = "EXPIRY"
                         else:
@@ -1038,20 +1039,10 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                 _available = bankroll - sum(p.size_usdc for p in positions)
 
                             sl_price = round(entry_p - SL_DELTA, 4)
-                            sl_oid = place_limit_sell(tok, sl_price, actual_shares, dry)
-                            if sl_oid == "no_balance":
-                                # balance=0 means BUY was never filled — phantom position.
-                                # Discard immediately rather than tracking a ghost trade.
-                                log.error("SL pre-placement: balance=0 — BUY not filled, "
-                                          "discarding phantom position %s", direction)
-                                notify("INFO", f"Position fantôme ignorée {direction}",
-                                       **{"Raison": "BUY annulé / pas rempli (balance CLOB = 0)"})
-                                continue
-                            elif sl_oid:
-                                log.info("SL pre-placed: %s @%.3f", sl_oid[:16], sl_price)
-                            else:
-                                log.warning("SL pre-placement failed for %s — scan-based fallback",
-                                            direction)
+                            # No pre-placed SL: Polymarket CLOB gives price improvement,
+                            # so a limit SELL at 0.15 fills immediately at market bid
+                            # (~0.35-0.70), spending the balance before HOLD activates.
+                            # SL monitoring is handled by token_ws + scan loop fallback.
 
                             pos = Position(
                                 market=mkt, token_id=tok, direction=direction,
@@ -1062,7 +1053,7 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                 peak_price=entry_p,
                                 trough_price=entry_p,
                                 trail_sl=sl_price,
-                                sl_order_id=sl_oid or "",
+                                sl_order_id="",
                                 mom15_at_entry=m15,
                                 mom30_at_entry=m30,
                                 mom60_at_entry=m60,
