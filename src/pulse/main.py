@@ -123,6 +123,12 @@ def run(dry: bool = True, hold_enabled: bool = True, dry_bankroll: float = 0.0):
     setup_logging()
     init_csv()
 
+    # In dry mode with --bankroll override, never call the real wallet API.
+    def _sync(force=False):
+        if dry and dry_bankroll > 0:
+            return dry_bankroll
+        return sync_wallet_usdc(force=force)
+
     # Private key warning
     import os
     pk = os.getenv("PRIVATE_KEY", "").strip()
@@ -197,7 +203,7 @@ def run(dry: bool = True, hold_enabled: bool = True, dry_bankroll: float = 0.0):
         bankroll = dry_bankroll
         log.info("Dry mode bankroll override: %.2f$", bankroll)
     else:
-        bankroll = sync_wallet_usdc(force=True)
+        bankroll = _sync(force=True)
         if bankroll <= 0:
             bankroll = BANKROLL
             log.warning("Wallet not found — fallback %.0f$", BANKROLL)
@@ -228,7 +234,7 @@ def run(dry: bool = True, hold_enabled: bool = True, dry_bankroll: float = 0.0):
                 stats.scans += 1
                 scan_state["best_score"] = 0.0
                 SPIKE_INTERRUPT.clear()
-                bankroll = sync_wallet_usdc()
+                bankroll = _sync()
                 m15, m30, m60 = FEED.momentum_all()
 
                 # ── WS-triggered SL/TP events (priority — ~100ms reaction) ──
@@ -326,7 +332,7 @@ def run(dry: bool = True, hold_enabled: bool = True, dry_bankroll: float = 0.0):
                                           "Session P&L": f"{stats.total_pnl:+.2f}$"})
                                 positions.remove(pos_hit)
                                 save_checkpoint(positions)
-                                bankroll = sync_wallet_usdc(force=True)
+                                bankroll = _sync(force=True)
                                 continue
                             # Still open (resting order) — cancel before retrying
                             cancel_order_safe(_prev_cid)
@@ -410,7 +416,7 @@ def run(dry: bool = True, hold_enabled: bool = True, dry_bankroll: float = 0.0):
                                 save_checkpoint(positions)
                                 log.warning("WS partial fill %.4f shares remain — keeping position", pos_hit.shares_held)
                                 continue
-                        bankroll = sync_wallet_usdc(force=True)
+                        bankroll = _sync(force=True)
                     else:
                         pos_hit.close_order_id = f"dry_ws_{int(time.time()*1000)}"
                         pos_hit.close_fill = "filled"
@@ -483,7 +489,7 @@ def run(dry: bool = True, hold_enabled: bool = True, dry_bankroll: float = 0.0):
                                     cancel_order_safe(pos.sl_order_id)
                                 pos.sl_order_id = ""
                             if not dry:
-                                bankroll = sync_wallet_usdc(force=True)
+                                bankroll = _sync(force=True)
                                 tg(f"EXPIRY {pos.direction} — resolved")
                             pnl = log_trade(pos, pos.current_price, "EXPIRY", stats,
                                             FEED.current, SETTINGS.min_score,
@@ -531,7 +537,7 @@ def run(dry: bool = True, hold_enabled: bool = True, dry_bankroll: float = 0.0):
                                 pos.current_price = exit_price
                                 token_ws.unsubscribe(pos.token_id)
                                 if not dry:
-                                    bankroll = sync_wallet_usdc(force=True)
+                                    bankroll = _sync(force=True)
                                 pnl = log_trade(pos, exit_price, reason_sl, stats,
                                                 FEED.current, SETTINGS.min_score,
                                                 mom15_exit=m15, rsi_exit=FEED.rsi())
@@ -586,7 +592,7 @@ def run(dry: bool = True, hold_enabled: bool = True, dry_bankroll: float = 0.0):
                                         pos.sl_order_id = ""
                                         pos.current_price = _sl_race_exit
                                         token_ws.unsubscribe(pos.token_id)
-                                        bankroll = sync_wallet_usdc(force=True)
+                                        bankroll = _sync(force=True)
                                         pnl = log_trade(
                                             pos, _sl_race_exit, _reason_slr, stats,
                                             FEED.current, SETTINGS.min_score,
@@ -765,7 +771,7 @@ def run(dry: bool = True, hold_enabled: bool = True, dry_bankroll: float = 0.0):
                                                 save_checkpoint(positions)
                                                 log.warning("Partial fill %.4f shares remain — keeping position", pos.shares_held)
                                                 continue
-                                        bankroll = sync_wallet_usdc(force=True)
+                                        bankroll = _sync(force=True)
                                 pos.current_price = exit_price
                             else:
                                 # Cancel any resting WS close order before EXPIRY
@@ -789,7 +795,7 @@ def run(dry: bool = True, hold_enabled: bool = True, dry_bankroll: float = 0.0):
                                     continue  # skip logging, keep position alive
                                 if not dry:
                                     time.sleep(5)
-                                    bankroll = sync_wallet_usdc(force=True)
+                                    bankroll = _sync(force=True)
                                     tg(f"EXPIRY {pos.direction} — auto resolution")
 
                             pnl = log_trade(pos, pos.current_price, reason, stats,
@@ -1062,7 +1068,7 @@ def run(dry: bool = True, hold_enabled: bool = True, dry_bankroll: float = 0.0):
                                     actual_shares = filled_shares
                                     log.info("Fill verified: %.4f shares (local est: %.4f)",
                                              filled_shares, shares)
-                                bankroll = sync_wallet_usdc(force=True)
+                                bankroll = _sync(force=True)
                                 _available = bankroll - sum(p.size_usdc for p in positions)
 
                             sl_price = round(entry_p - SL_DELTA, 4)
@@ -1216,7 +1222,7 @@ def validate():
     # 2. Wallet balance
     console.print("\n[bold]2. Wallet[/]")
     _check("Balance USDC on-chain",
-           lambda: f"{sync_wallet_usdc(force=True):.2f} USDC")
+           lambda: f"{_sync(force=True):.2f} USDC")
 
     # 3. Fetch active BTC market
     console.print("\n[bold]3. Marché BTC 5min[/]")
