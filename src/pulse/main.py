@@ -271,6 +271,11 @@ def run(dry: bool = True, hold_enabled: bool = True):
                         exit_price = ws_price
                     # Clamp to CLOB valid range — near-expiry prices can reach 0.99+
                     exit_price = min(max(exit_price, 0.01), 0.99)
+                    # Dry mode: simulate execution delay slippage on SL exits
+                    if dry and ws_reason == "SL":
+                        _gap_ws = max(0.0, round(pos_hit.entry_price - SL_DELTA, 4) - ws_price)
+                        _slip_ws = round(0.015 + _gap_ws * 0.25, 3)
+                        exit_price = max(exit_price - _slip_ws, 0.01)
                     reason_ws = (f"SL {exit_price:.3f}(<{round(pos_hit.entry_price - SL_DELTA, 4):.3f})"
                                  if ws_reason == "SL"
                                  else f"TP {exit_price:.3f}(>{round(pos_hit.entry_price + TP_DELTA, 4):.3f})")
@@ -711,6 +716,14 @@ def run(dry: bool = True, hold_enabled: bool = True):
                                         continue
 
                                     exit_price = min(max(ob2["bb"], 0.01), 0.99)
+                                    # Dry mode: simulate 1-3s execution delay on SL exits.
+                                    # In live, the SELL order fills after bid may drop further.
+                                    # Slippage scales with how far below SL price has already gapped.
+                                    if dry and "SL" in reason:
+                                        _eff_sl = round(pos.entry_price - SL_DELTA, 4)
+                                        _gap = max(0.0, _eff_sl - pos.current_price)
+                                        _slippage = round(0.02 + _gap * 0.30, 3)
+                                        exit_price = max(exit_price - _slippage, 0.01)
                                     try:
                                         close_id, fill_status, filled_shares_close = close_position(
                                             pos.token_id, exit_price, pos.shares_held, dry)
