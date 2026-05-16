@@ -118,7 +118,7 @@ def _keyboard_thread():
 
 
 # ── Main loop ────────────────────────────────────────────────────────────────
-def run(dry: bool = True, hold_enabled: bool = True):
+def run(dry: bool = True, hold_enabled: bool = True, dry_bankroll: float = 0.0):
     console = Console(force_terminal=True)
     setup_logging()
     init_csv()
@@ -193,12 +193,16 @@ def run(dry: bool = True, hold_enabled: bool = True):
         stats.losses += (_missed_count - _missed_wins)
     threading.Thread(target=lambda: _recap_loop(stats), name="recap", daemon=True).start()
     blacklist = ExpiringBlacklist(ttl=360.0)
-    bankroll = sync_wallet_usdc(force=True)
-    if bankroll <= 0:
-        bankroll = BANKROLL
-        log.warning("Wallet not found — fallback %.0f$", BANKROLL)
+    if dry and dry_bankroll > 0:
+        bankroll = dry_bankroll
+        log.info("Dry mode bankroll override: %.2f$", bankroll)
     else:
-        log.info("pUSD on-chain: %.2f$", bankroll)
+        bankroll = sync_wallet_usdc(force=True)
+        if bankroll <= 0:
+            bankroll = BANKROLL
+            log.warning("Wallet not found — fallback %.0f$", BANKROLL)
+        else:
+            log.info("pUSD on-chain: %.2f$", bankroll)
 
     countdown = float(SETTINGS.scan_interval)
     last_spike_ts = 0.0
@@ -1320,6 +1324,8 @@ def cli():
     p.add_argument("--scan", type=int, default=SCAN_INTERVAL, help=f"Scan interval secs (default: {SCAN_INTERVAL})")
     p.add_argument("--max-loss", type=float, default=MAX_DAILY_LOSS, help=f"Circuit breaker $ (default: {MAX_DAILY_LOSS})")
     p.add_argument("--no-hold", action="store_true", help="Disable hold-to-expiry")
+    p.add_argument("--bankroll", type=float, default=0.0,
+                   help="Bankroll simulee en dry mode (ex: --bankroll 50)")
     p.add_argument("--log-level", type=str, default="INFO", help="Log level (default: INFO)")
     args = p.parse_args()
 
@@ -1346,7 +1352,7 @@ def cli():
         print("\nLIVE MODE in 5s — Ctrl+C to cancel...")
         time.sleep(5)
 
-    run(dry=not args.live, hold_enabled=hold_enabled)
+    run(dry=not args.live, hold_enabled=hold_enabled, dry_bankroll=args.bankroll)
 
 
 if __name__ == "__main__":
