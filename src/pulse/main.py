@@ -744,13 +744,41 @@ def run(dry: bool = True, hold_enabled: bool = True, dry_bankroll: float = 0.0):
                                     pos.close_fill = fill_status
                                     if not dry:
                                         if close_id is None:
-                                            scan_state["log"].appendleft({
-                                                "type": "skip", "dir": pos.direction,
-                                                "reason": "CLOSE FAILED — kept",
-                                                "mom15": m15, "mom60": m60,
-                                            })
-                                            log.error("Close failed for %s %s",
-                                                      pos.direction, pos.token_id[:16])
+                                            if fill_status == "no_balance":
+                                                # Balance=0: BUY was never filled or already
+                                                # closed externally. Verify before declaring phantom.
+                                                _bc, _ = poll_order_status(pos.order_id, timeout=3.0)
+                                                if _bc in ("filled", "partial"):
+                                                    _cbe = pos.current_price if pos.current_price > 0.01 else exit_price
+                                                    log.warning("Scan no_balance but BUY filled — SL closed: %s @~%.3f",
+                                                                pos.direction, _cbe)
+                                                    pos.close_order_id = "sl_auto_balance0"
+                                                    pos.close_fill = "sl_auto"
+                                                    pnl = log_trade(pos, _cbe, reason, stats,
+                                                                    FEED.current, SETTINGS.min_score,
+                                                                    mom15_exit=m15, rsi_exit=FEED.rsi())
+                                                    stats.total_pnl += pnl; stats.total += 1
+                                                    if pnl >= 0: stats.wins += 1
+                                                    else: stats.losses += 1
+                                                    _lvl = "WIN" if pnl >= 0 else "LOSS"
+                                                    notify(_lvl, f"{_lvl} — BTC {pos.direction}",
+                                                           **{"P&L net": f"{pnl:+.2f}$", "Raison": "SL auto (balance=0)",
+                                                              "Session P&L": f"{stats.total_pnl:+.2f}$"})
+                                                else:
+                                                    log.error("Scan close no_balance — phantom: %s %s",
+                                                              pos.direction, pos.token_id[:16])
+                                                    notify("INFO", f"Position fantôme retirée {pos.direction}",
+                                                           **{"Raison": "balance=0 (BUY non rempli)"})
+                                                token_ws.unsubscribe(pos.token_id)
+                                                closed.append(pos)
+                                            else:
+                                                scan_state["log"].appendleft({
+                                                    "type": "skip", "dir": pos.direction,
+                                                    "reason": "CLOSE FAILED — kept",
+                                                    "mom15": m15, "mom60": m60,
+                                                })
+                                                log.error("Close failed for %s %s",
+                                                          pos.direction, pos.token_id[:16])
                                             continue
                                         if fill_status not in ("filled", "partial"):
                                             scan_state["log"].appendleft({
