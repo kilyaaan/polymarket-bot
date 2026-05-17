@@ -354,8 +354,9 @@ def run(dry: bool = True, hold_enabled: bool = True, dry_bankroll: float = 0.0):
                                 # B) BUY filled but tokens already spent by the
                                 #    pre-placed SL order (race vs HOLD cancel).
                                 # Check the original BUY order status to tell apart.
+                                # Use 15s timeout — CLOB can lag several seconds on fill reflection.
                                 _buy_chk, _ = poll_order_status(
-                                    pos_hit.order_id, timeout=3.0)
+                                    pos_hit.order_id, timeout=15.0)
                                 if _buy_chk in ("filled", "partial"):
                                     # Case B: real trade, closed by SL in CLOB book.
                                     # Use current_price as best estimate of fill
@@ -747,7 +748,8 @@ def run(dry: bool = True, hold_enabled: bool = True, dry_bankroll: float = 0.0):
                                             if fill_status == "no_balance":
                                                 # Balance=0: BUY was never filled or already
                                                 # closed externally. Verify before declaring phantom.
-                                                _bc, _ = poll_order_status(pos.order_id, timeout=3.0)
+                                                # Use 15s timeout — CLOB can lag several seconds on fill reflection.
+                                                _bc, _ = poll_order_status(pos.order_id, timeout=15.0)
                                                 if _bc in ("filled", "partial"):
                                                     _cbe = pos.current_price if pos.current_price > 0.01 else exit_price
                                                     log.warning("Scan no_balance but BUY filled — SL closed: %s @~%.3f",
